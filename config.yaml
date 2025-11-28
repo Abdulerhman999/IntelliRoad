@@ -1,0 +1,22 @@
+mysql:
+  host: "localhost"
+  user: "root"
+  password: "andromeda@2006"
+  db: "ml_xgboost"
+
+paths:
+  pdf_folder: "static/downloaded_pdfs"
+  models_folder: "models"
+
+selenium:
+  driver_path: "/path/to/chromedriver"
+  headless: true
+
+genai:
+  enabled: true
+
+training:
+  model_path: "models/xgb_model.joblib"
+  scaler_path: "models/scaler.joblib"
+  test_size: 0.2
+  random_state: 42
