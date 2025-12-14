@@ -1,4 +1,39 @@
 -- -------------------------------------------------------------
+--  USERS AND PROJECTS TABLES
+-- -------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS users (
+    user_id           INT AUTO_INCREMENT PRIMARY KEY,
+    name              VARCHAR(255) NOT NULL,
+    email             VARCHAR(255) NOT NULL UNIQUE,
+    phone             VARCHAR(50),
+    username          VARCHAR(100) NOT NULL UNIQUE,
+    password_hash     VARCHAR(255) NOT NULL,
+    created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS projects (
+    project_id        INT AUTO_INCREMENT PRIMARY KEY,
+    user_id           INT NOT NULL,
+    project_name      VARCHAR(255) NOT NULL,
+    location          VARCHAR(255),
+    location_type     VARCHAR(50),  -- 'plain' or 'mountainous'
+    max_budget_pkr    DOUBLE,
+    parent_company    VARCHAR(255),
+    road_length_km    DOUBLE,
+    road_width_m      DOUBLE,
+    project_type      VARCHAR(100), -- 'highway', 'urban_road', 'rural_road'
+    soil_type         VARCHAR(50),
+    traffic_volume    VARCHAR(50),
+    predicted_cost    DOUBLE,
+    climate_score     DOUBLE,
+    within_budget     BOOLEAN,
+    features_json     JSON,
+    pdf_path          TEXT,
+    created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+);
+-- -------------------------------------------------------------
 --  CORE PROJECT TABLES
 -- -------------------------------------------------------------
 
@@ -108,6 +143,15 @@ CREATE TABLE IF NOT EXISTS features_cache (
     features_json     JSON,
     target_cost       DOUBLE,
     created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (tender_id) REFERENCES tenders(tender_id)
+);
+CREATE TABLE IF NOT EXISTS ml_training_data (
+    training_id       INT AUTO_INCREMENT PRIMARY KEY,
+    tender_id         INT,
+    features_json     JSON,
+    label_cost        DOUBLE,
+    created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(tender_id),
     FOREIGN KEY (tender_id) REFERENCES tenders(tender_id)
 );
 

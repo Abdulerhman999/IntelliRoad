@@ -17,24 +17,28 @@ def get_conn():
 def insert_tender_record(tender):
     conn = get_conn()
     cur = conn.cursor()
-    # Map tender dict into the current `tenders` table schema. The DB schema
-    # uses different column names (see sql/schema.sql), so populate available
-    # columns defensively.
     cur.execute("""
         INSERT INTO tenders
-        (source_site, tender_url, tender_no, title, department, city, province, publish_date, closing_date, raw_pdf_path, created_at)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+        (source_site, tender_url, tender_no, title, department, city, province, 
+         publish_date, closing_date, category, procurement_method, opening_date, 
+         status, organization, raw_pdf_path, created_at)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
     """, (
-        tender.get("source") or tender.get("source_site") or tender.get("org_id"),
-        tender.get("external_url") or tender.get("tender_url") or tender.get("pdf_url"),
-        tender.get("external_id") or tender.get("tender_no") or tender.get("contract_no") or tender.get("contract_no"),
-        tender.get("title") or tender.get("contract_title") or tender.get("contract_title"),
+        tender.get("source_site"),
+        tender.get("tender_url"),
+        tender.get("tender_no"),
+        tender.get("title"),
         tender.get("department"),
-        tender.get("location") or tender.get("city"),
+        tender.get("city"),
         tender.get("province"),
-        tender.get("published_date") or tender.get("publish_date"),
+        tender.get("publish_date"),
         tender.get("closing_date"),
-        tender.get("pdf_path") or tender.get("pdf_url")
+        tender.get("category"),
+        tender.get("procurement_method"),
+        tender.get("opening_date"),
+        tender.get("status"),
+        tender.get("organization"),
+        tender.get("raw_pdf_path")
     ))
     tid = cur.lastrowid
     conn.commit()
@@ -57,23 +61,20 @@ def upsert_material(name, unit):
     conn.close()
     return mid
 
-def insert_boq_line(tender_id, boq_id, item_code, description, unit, quantity, rate, cost, raw_line, db=None):
-    """
-    Insert a parsed BOQ line into the boqs table.
-    If db connection is not passed, create one internally.
-    """
-    conn = db or get_conn()
+def insert_boq_line(tender_id, boq_id, item_code, description, unit, quantity, rate, cost, raw_line):
+    """Insert a parsed BOQ line into the boq_items table."""
+    conn = get_conn()
     cur = conn.cursor()
+    
     cur.execute("""
-        INSERT INTO boqs
-        (tender_id, boq_id, item_code, description, unit, quantity, unit_cost_pkr, total_cost_pkr, raw_line)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-    """, (tender_id, boq_id, item_code, description, unit, quantity, rate, cost, raw_line))
+        INSERT INTO boq_items
+        (tender_id, boq_id, item_code, description, unit, quantity, rate, cost, created_at)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+    """, (tender_id, boq_id, item_code, description, unit, quantity, rate, cost))
+    
     conn.commit()
-
-    if not db:
-        cur.close()
-        conn.close()
+    cur.close()
+    conn.close()
 
 def insert_boq_file(tender_id, file_path, extracted_text, db=None):
     """
