@@ -434,15 +434,7 @@ async def predict_project_cost(input_data: ProjectInput, user_id: int):
         # Prepare features for ML model
         ml_features, cement_qty_ton, bitumen_qty_ton, steel_qty_ton = prepare_ml_features(
             input_data, materials_result, prices
-        )
-        
-        print(f"[INFO] ML Features prepared: {ml_features}")
-        
-        # Use materials total as the predicted cost (BOQ only)
-        predicted_cost = materials_total_boq
-        
-        print(f"[INFO] BOQ Materials Cost: PKR {predicted_cost:,.2f}")
-        
+        )       
         # Calculate climate impact using actual material quantities (in kg)
         material_costs_kg = {
             "cement_opc": materials_result["cement_opc"],
@@ -454,11 +446,7 @@ async def predict_project_cost(input_data: ProjectInput, user_id: int):
         }
         
         climate_data = calculate_climate_impact(material_costs_kg)
-        climate_score = climate_data["total_emissions_tons"]
-        
-        # Check if within budget
-        within_budget = predicted_cost <= input_data.max_budget_pkr
-        
+        climate_score = climate_data["total_emissions_tons"]        
         # Generate detailed BOQ for PDF with all 24 materials
         boq_lines = []
         boq_lines.append(f"Road Type: {input_data.project_type.replace('_', ' ').title()}")
@@ -528,13 +516,19 @@ async def predict_project_cost(input_data: ProjectInput, user_id: int):
                 )
                 material_breakdown.append(f"  • {display_name}: {qty:.2f} {unit}")
         
+        # Use materials total as the predicted cost (BOQ only)
+        predicted_cost = materials_total_boq
         boq_lines.append("=" * 100)
         boq_lines.append(f"{'TOTAL MATERIALS COST (BOQ Estimated)':<75} PKR {materials_total_boq:>20,.2f}")
         boq_lines.append("")
         boq_lines.append("Note: This BOQ includes material costs only. Labor, machinery, profits,")
         boq_lines.append("      and contractor overhead are NOT included in this estimate.")
-        
         boq_text = "\n".join(boq_lines)
+        print(f"[INFO] ML Features prepared: {ml_features}")    
+        print(f"[INFO] BOQ Materials Cost: PKR {predicted_cost:,.2f}")
+        
+        # Check if within budget
+        within_budget = predicted_cost <= input_data.max_budget_pkr
         
         # Store in database
         features_json = json.dumps({
@@ -809,7 +803,7 @@ Model Version: XGBoost-v1.0 (Trained on 500 projects)
         print(f"[ERROR] Prediction failed: {e}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) 
 
 # ============================================================================
 # FILE DOWNLOAD
