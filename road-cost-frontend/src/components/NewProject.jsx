@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { predictProject, downloadPDF } from '../services/api';
-import { ArrowLeft, TrendingUp, CheckCircle, Download } from 'lucide-react';
+import axios from 'axios';
+import { ArrowLeft, TrendingUp, CheckCircle, Download, Eye } from 'lucide-react';
 
 const NewProject = ({ user }) => {
   const navigate = useNavigate();
@@ -35,25 +35,35 @@ const NewProject = ({ user }) => {
     setLoading(true);
 
     try {
-      // Convert string numbers to floats
       const projectData = {
-        ...formData,
+        project_name: formData.project_name,
+        location: formData.location,
+        location_type: formData.location_type,
         max_budget_pkr: parseFloat(formData.max_budget_pkr),
+        parent_company: formData.parent_company,
         road_length_km: parseFloat(formData.road_length_km),
         road_width_m: parseFloat(formData.road_width_m),
+        project_type: formData.project_type,
+        soil_type: formData.soil_type,
+        traffic_volume: formData.traffic_volume,
       };
 
-      const response = await predictProject(projectData, user.user_id);
-      setResult(response);
+      const response = await axios.post(
+        `http://localhost:8000/api/predict?user_id=${user.user_id}`,
+        projectData
+      );
+      
+      setResult(response.data);
     } catch (err) {
+      console.error('Prediction error:', err);
       setError(err.response?.data?.detail || 'Prediction failed. Please try again.');
     } finally {
       setLoading(false);
     }
   };
 
-  const handleDownload = () => {
-    window.open(downloadPDF(result.project_id), '_blank');
+  const handleViewReport = () => {
+    navigate(`/project/${result.project_id}/details`);
   };
 
   if (result) {
@@ -64,7 +74,7 @@ const NewProject = ({ user }) => {
             <CheckCircle size={80} color="#43a047" />
           </div>
           <h2 className="form-title" style={{ justifyContent: 'center' }}>
-            Report Generated Successfully!
+            Prediction Generated Successfully!
           </h2>
           <div style={{ marginTop: '2rem', marginBottom: '2rem', padding: '1.5rem', background: '#e8f5e9', borderRadius: '10px' }}>
             <h3 style={{ color: '#2e7d32', marginBottom: '1rem', fontSize: '1.3rem' }}>
@@ -74,13 +84,13 @@ const NewProject = ({ user }) => {
               <div>
                 <p style={{ color: '#66bb6a', fontSize: '0.9rem' }}>Predicted Cost</p>
                 <p style={{ color: '#2e7d32', fontSize: '1.5rem', fontWeight: '700' }}>
-                  PKR {result.predicted_cost.toLocaleString()}
+                  PKR {result.predicted_cost?.toLocaleString() || '0'}
                 </p>
               </div>
               <div>
-                <p style={{ color: '#66bb6a', fontSize: '0.9rem' }}>Climate Impact</p>
+                <p style={{ color: '#66bb6a', fontSize: '0.9rem' }}>CO₂ Emissions</p>
                 <p style={{ color: '#2e7d32', fontSize: '1.5rem', fontWeight: '700' }}>
-                  {result.climate_score.toFixed(2)} tons CO₂
+                  {result.co2_emissions_tons?.toFixed(2) || '0'} tons
                 </p>
               </div>
               <div>
@@ -96,9 +106,9 @@ const NewProject = ({ user }) => {
             </div>
           </div>
           <div style={{ display: 'flex', gap: '1rem', justifyContent: 'center', flexWrap: 'wrap' }}>
-            <button className="btn-primary" style={{ maxWidth: '300px' }} onClick={handleDownload}>
-              <Download size={20} style={{ display: 'inline', marginRight: '0.5rem' }} />
-              Download PDF Report
+            <button className="btn-primary" style={{ maxWidth: '300px' }} onClick={handleViewReport}>
+              <Eye size={20} style={{ display: 'inline', marginRight: '0.5rem' }} />
+              View Full Details
             </button>
             <button className="btn-secondary" style={{ maxWidth: '200px' }} onClick={() => navigate('/dashboard')}>
               Back to Dashboard

@@ -24,7 +24,6 @@ const Login = ({ onLogin }) => {
     e.preventDefault();
     setError('');
     setLoading(true);
-
     try {
       const response = await login(formData);
       onLogin(response);
@@ -82,8 +81,9 @@ const Login = ({ onLogin }) => {
         </form>
 
         <div className="auth-link">
-          Don't have an account?{' '}
-          <button onClick={() => navigate('/register')}>Create Account</button>
+          <p style={{ textAlign: 'center', color: '#666', marginTop: '1rem' }}>
+            Only administrators can create accounts
+          </p>
         </div>
       </div>
     </div>

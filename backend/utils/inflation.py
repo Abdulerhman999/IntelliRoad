@@ -127,7 +127,7 @@ def seed_material_price_history():
     print("="*60)
 
 def get_inflation_multiplier(year):
-    """Get inflation multiplier for a given year"""
+    """Get inflation multiplier for a given year""" 
     multipliers = {2023: 1.00, 2024: 1.18, 2025: 1.32}
     return multipliers.get(year, 1.0)
 

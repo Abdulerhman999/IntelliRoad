@@ -1,12 +1,18 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { getUserProjects, downloadPDF } from '../services/api';
-import { Plus, Download, Calendar, DollarSign, Leaf, CheckCircle, XCircle, FileText } from 'lucide-react';
+import axios from 'axios';
+import { Plus, Calendar, DollarSign, Leaf, CheckCircle, XCircle, Eye, Filter, X } from 'lucide-react';
 
 const Dashboard = ({ user }) => {
   const navigate = useNavigate();
   const [projects, setProjects] = useState([]);
   const [loading, setLoading] = useState(true);
+  
+  // Filters
+  const [locationFilter, setLocationFilter] = useState('');
+  const [minBudget, setMinBudget] = useState('');
+  const [maxBudget, setMaxBudget] = useState('');
+  const [showFilters, setShowFilters] = useState(false);
 
   useEffect(() => {
     if (!user) {
@@ -14,12 +20,18 @@ const Dashboard = ({ user }) => {
       return;
     }
     fetchProjects();
-  }, [user, navigate]);
+  }, [user, navigate, locationFilter, minBudget, maxBudget]);
 
   const fetchProjects = async () => {
     try {
-      const data = await getUserProjects(user.user_id);
-      setProjects(data);
+      const params = new URLSearchParams();
+      if (locationFilter) params.append('location_type', locationFilter);
+      if (minBudget) params.append('min_budget', minBudget);
+      if (maxBudget) params.append('max_budget', maxBudget);
+      
+      const url = `http://localhost:8000/api/projects/${user.user_id}${params.toString() ? '?' + params.toString() : ''}`;
+      const response = await axios.get(url);
+      setProjects(response.data);
     } catch (error) {
       console.error('Error fetching projects:', error);
     } finally {
@@ -27,8 +39,14 @@ const Dashboard = ({ user }) => {
     }
   };
 
-  const handleDownload = (projectId) => {
-    window.open(downloadPDF(projectId), '_blank');
+  const handleViewDetails = (projectId) => {
+    navigate(`/project/${projectId}/details`);
+  };
+
+  const clearFilters = () => {
+    setLocationFilter('');
+    setMinBudget('');
+    setMaxBudget('');
   };
 
   if (loading) {
@@ -45,6 +63,105 @@ const Dashboard = ({ user }) => {
         </button>
       </div>
 
+      {/* Filters Section */}
+      <div className="filters-section" style={{ marginBottom: '2rem' }}>
+        <button 
+          className="btn-filter-toggle"
+          onClick={() => setShowFilters(!showFilters)}
+          style={{
+            background: '#e8f5e9',
+            border: '2px solid #43a047',
+            padding: '0.75rem 1.5rem',
+            borderRadius: '8px',
+            cursor: 'pointer',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '0.5rem',
+            fontWeight: '600',
+            color: '#2e7d32'
+          }}
+        >
+          <Filter size={18} />
+          {showFilters ? 'Hide Filters' : 'Show Filters'}
+        </button>
+        
+        {showFilters && (
+          <div className="filters-panel" style={{
+            background: 'white',
+            padding: '1.5rem',
+            borderRadius: '10px',
+            marginTop: '1rem',
+            boxShadow: '0 2px 8px rgba(0,0,0,0.1)',
+            display: 'grid',
+            gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))',
+            gap: '1rem',
+            alignItems: 'end'
+          }}>
+            <div className="filter-group">
+              <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600', color: '#2e7d32' }}>
+                Location Type:
+              </label>
+              <select 
+                value={locationFilter} 
+                onChange={(e) => setLocationFilter(e.target.value)}
+                className="form-select"
+              >
+                <option value="">All Locations</option>
+                <option value="plain">Plain</option>
+                <option value="mountainous">Mountainous</option>
+              </select>
+            </div>
+            
+            <div className="filter-group">
+              <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600', color: '#2e7d32' }}>
+                Min Budget (PKR):
+              </label>
+              <input 
+                type="number" 
+                value={minBudget} 
+                onChange={(e) => setMinBudget(e.target.value)}
+                placeholder="e.g., 1000000"
+                className="form-input"
+              />
+            </div>
+            
+            <div className="filter-group">
+              <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: '600', color: '#2e7d32' }}>
+                Max Budget (PKR):
+              </label>
+              <input 
+                type="number" 
+                value={maxBudget} 
+                onChange={(e) => setMaxBudget(e.target.value)}
+                placeholder="e.g., 50000000"
+                className="form-input"
+              />
+            </div>
+            
+            <button 
+              className="btn-clear-filters"
+              onClick={clearFilters}
+              style={{
+                background: '#ff9800',
+                color: 'white',
+                border: 'none',
+                padding: '0.75rem 1rem',
+                borderRadius: '8px',
+                cursor: 'pointer',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '0.5rem',
+                justifyContent: 'center',
+                fontWeight: '600'
+              }}
+            >
+              <X size={16} />
+              Clear Filters
+            </button>
+          </div>
+        )}
+      </div>
+
       {projects.length === 0 ? (
         <div className="empty-state">
           <div className="empty-state-icon">📊</div>
@@ -52,7 +169,11 @@ const Dashboard = ({ user }) => {
           <p className="empty-state-text">
             Start by creating your first project prediction
           </p>
-          <button className="btn-primary" style={{ maxWidth: '300px', margin: '0 auto' }} onClick={() => navigate('/new-project')}>
+          <button 
+            className="btn-primary" 
+            style={{ maxWidth: '300px', margin: '0 auto' }} 
+            onClick={() => navigate('/new-project')}
+          >
             <Plus size={20} style={{ display: 'inline', marginRight: '0.5rem' }} />
             Create First Project
           </button>
@@ -70,14 +191,14 @@ const Dashboard = ({ user }) => {
                 <div className="project-stats">
                   <div className="stat-item">
                     <DollarSign size={18} />
-                    <span>PKR {project.predicted_cost.toLocaleString()}</span>
+                    <span>PKR {(project.predicted_cost || 0).toLocaleString()}</span>
                   </div>
                   <div className="stat-item">
                     <Leaf size={18} />
-                    <span>{project.climate_score.toFixed(2)} tons CO₂</span>
+                    <span>{(project.co2_emissions || 0).toFixed(2)} tons CO₂</span>
                   </div>
                   <div className="stat-item">
-                    {project.within_budget ? (
+                    {project.budget_status === 'Within Budget' ? (
                       <>
                         <CheckCircle size={18} color="#43a047" />
                         <span className="badge-success">Within Budget</span>
@@ -91,13 +212,16 @@ const Dashboard = ({ user }) => {
                   </div>
                 </div>
               </div>
-              <button 
-                className="btn-download" 
-                onClick={() => handleDownload(project.project_id)}
-              >
-                <Download size={20} />
-                Download PDF
-              </button>
+              <div className="project-actions" style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                <button 
+                  className="btn-download" 
+                  onClick={() => handleViewDetails(project.project_id)}
+                  style={{ width: '100%' }}
+                >
+                  <Eye size={18} />
+                  View Details
+                </button>
+              </div>
             </div>
           ))}
         </div>

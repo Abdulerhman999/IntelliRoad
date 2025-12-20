@@ -1,5 +1,4 @@
 import axios from 'axios';
-
 const API_BASE_URL = 'http://localhost:8000/api';
 
 const api = axios.create({
@@ -28,6 +27,11 @@ export const getUserProjects = async (userId) => {
 
 export const predictProject = async (projectData, userId) => {
   const response = await api.post(`/predict?user_id=${userId}`, projectData);
+  return response.data;
+};
+
+export const getProjectFullDetails = async (projectId) => {
+  const response = await api.get(`/project/${projectId}/full_details`);
   return response.data;
 };
 

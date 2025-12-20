@@ -1,19 +1,31 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime
+import subprocess
 import json
 import os
+import hashlib
+import pymysql
+import yaml
 
-from backend.database import get_conn
-from backend.ml.inference import predict_cost
-from backend.utils.pdf_output import generate_output_pdf
-from backend.utils.inflation import seed_material_price_history
+# Load config
+cfg = yaml.safe_load(open("config.yaml"))
 
-app = FastAPI(title="Road Cost Prediction API")
+def get_conn():
+    return pymysql.connect(
+        host=cfg["mysql"]["host"],
+        user=cfg["mysql"]["user"],
+        password=cfg["mysql"]["password"],
+        db=cfg["mysql"]["db"],
+        cursorclass=pymysql.cursors.DictCursor,
+        charset="utf8mb4"
+    )
 
-# CORS for React frontend
+app = FastAPI(title="Road Cost Prediction API - Redesigned")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "http://localhost:5173"],
@@ -26,6 +38,10 @@ app.add_middleware(
 # DATA MODELS
 # ============================================================================
 
+class UserLogin(BaseModel):
+    username: str
+    password: str
+
 class UserCreate(BaseModel):
     name: str
     email: str
@@ -33,875 +49,1338 @@ class UserCreate(BaseModel):
     username: str
     password: str
 
-class UserLogin(BaseModel):
-    username: str
-    password: str
+class PasswordChange(BaseModel):
+    old_password: str
+    new_password: str
 
 class ProjectInput(BaseModel):
     project_name: str
     location: str
-    location_type: str  # "plain" or "mountainous"
+    location_type: str
     max_budget_pkr: float
     parent_company: str
     road_length_km: float
     road_width_m: float
-    project_type: str  # "highway", "urban_road", "rural_road", "expressway"
-    soil_type: Optional[str] = "normal"
-    traffic_volume: Optional[str] = "medium"  # "low", "medium", "high"
+    project_type: str
+    soil_type: str = "normal"
+    traffic_volume: str = "medium"
 
-class ProjectResponse(BaseModel):
-    project_id: int
+class MaterialPriceUpdate(BaseModel):
+    material_id: int
+    price_current: float
+
+class TenderTrainingData(BaseModel):
+    tender_no: str
     project_name: str
-    predicted_cost: float
-    climate_score: float
-    within_budget: bool
-    pdf_url: str
-    created_at: str
+    organization: str
+    location: str
+    location_type: str
+    parent_company: str
+    road_length_km: float
+    road_width_m: float
+    project_type: str
+    traffic_volume: str
+    soil_type: str
+    actual_cost_pkr: float
+    boq_items: List[dict] # [{material_name, quantity, unit, unit_price}]
 
 # ============================================================================
-# USER AUTHENTICATION
+# AUTHENTICATION
 # ============================================================================
-
-@app.post("/api/auth/register")
-async def register(user: UserCreate):
-    """Register a new user"""
-    conn = get_conn()
-    cur = conn.cursor()
-    
-    cur.execute("SELECT 1 FROM users WHERE username=%s", (user.username,))
-    if cur.fetchone():
-        cur.close()
-        conn.close()
-        raise HTTPException(status_code=400, detail="Username already exists")
-    
-    import hashlib
-    password_hash = hashlib.sha256(user.password.encode()).hexdigest()
-    
-    cur.execute("""
-        INSERT INTO users (name, email, phone, username, password_hash, created_at)
-        VALUES (%s, %s, %s, %s, %s, NOW())
-    """, (user.name, user.email, user.phone, user.username, password_hash))
-    
-    conn.commit()
-    user_id = cur.lastrowid
-    cur.close()
-    conn.close()
-    
-    return {"message": "User registered successfully", "user_id": user_id}
 
 @app.post("/api/auth/login")
 async def login(credentials: UserLogin):
-    """Login user"""
+    """Login for admin and employees"""
     conn = get_conn()
     cur = conn.cursor()
-    
-    import hashlib
+
     password_hash = hashlib.sha256(credentials.password.encode()).hexdigest()
-    
     cur.execute("""
-        SELECT user_id, name, email FROM users 
+        SELECT user_id, name, email, role FROM users
         WHERE username=%s AND password_hash=%s
     """, (credentials.username, password_hash))
-    
+
     user = cur.fetchone()
     cur.close()
     conn.close()
-    
+
     if not user:
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    
+
     return {
         "user_id": user['user_id'],
         "name": user['name'],
         "email": user['email'],
+        "role": user['role'],
         "token": f"user_{user['user_id']}"
     }
+
+@app.post("/api/auth/change-password")
+async def change_password(user_id: int, password_data: PasswordChange):
+    """Change user password"""
+    conn = get_conn()
+    cur = conn.cursor()
+
+    # Verify old password
+    old_hash = hashlib.sha256(password_data.old_password.encode()).hexdigest()
+    cur.execute("SELECT 1 FROM users WHERE user_id=%s AND password_hash=%s", (user_id, old_hash))
+
+    if not cur.fetchone():
+        cur.close()
+        conn.close()
+        raise HTTPException(status_code=400, detail="Incorrect old password")
+
+    # Update password
+    new_hash = hashlib.sha256(password_data.new_password.encode()).hexdigest()
+    cur.execute("UPDATE users SET password_hash=%s WHERE user_id=%s", (new_hash, user_id))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return {"message": "Password changed successfully"}
+
+# ============================================================================
+# ADMIN: USER MANAGEMENT
+# ============================================================================
+
+@app.post("/api/admin/create-user")
+async def admin_create_user(admin_id: int, user_data: UserCreate):
+    """Admin creates employee account"""
+    conn = get_conn()
+    cur = conn.cursor()
+
+    # Verify admin
+    cur.execute("SELECT role FROM users WHERE user_id=%s", (admin_id,))
+    admin = cur.fetchone()
+
+    if not admin or admin['role'] != 'admin':
+        cur.close()
+        conn.close()
+        raise HTTPException(status_code=403, detail="Only admins can create users")
+
+    # Check if username exists
+    cur.execute("SELECT 1 FROM users WHERE username=%s", (user_data.username,))
+    if cur.fetchone():
+        cur.close()
+        conn.close()
+        raise HTTPException(status_code=400, detail="Username already exists")
+
+    # Create user
+    password_hash = hashlib.sha256(user_data.password.encode()).hexdigest()
+    cur.execute("""
+        INSERT INTO users (name, email, phone, username, password_hash, role, created_by)
+        VALUES (%s, %s, %s, %s, %s, 'employee', %s)
+    """, (user_data.name, user_data.email, user_data.phone, user_data.username, password_hash, admin_id))
+
+    conn.commit()
+    user_id = cur.lastrowid
+    cur.close()
+    conn.close()
+
+    return {"message": "User created successfully", "user_id": user_id}
+
+@app.get("/api/admin/users")
+async def get_all_users(admin_id: int):
+    """Get all employees (admin only)"""
+    conn = get_conn()
+    cur = conn.cursor()
+
+    # Verify admin
+    cur.execute("SELECT role FROM users WHERE user_id=%s", (admin_id,))
+    admin = cur.fetchone()
+
+    if not admin or admin['role'] != 'admin':
+        cur.close()
+        conn.close()
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    # Get all users except admin
+    cur.execute("""
+        SELECT user_id, name, email, phone, username, role, created_at
+        FROM users
+        WHERE role='employee'
+        ORDER BY created_at DESC
+    """)
+    users = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    return [{"user_id": u['user_id'], "name": u['name'], "email": u['email'],
+            "phone": u['phone'], "username": u['username'],
+            "created_at": u['created_at'].strftime("%Y-%m-%d %H:%M")} for u in users]
+
+@app.delete("/api/admin/delete-user/{user_id}")
+async def delete_user(admin_id: int, user_id: int):
+    """Admin deletes employee (projects remain)"""
+    conn = get_conn()
+    cur = conn.cursor()
+
+    # Verify admin
+    cur.execute("SELECT role FROM users WHERE user_id=%s", (admin_id,))
+    admin = cur.fetchone()
+
+    if not admin or admin['role'] != 'admin':
+        cur.close()
+        conn.close()
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    # Check if user is employee
+    cur.execute("SELECT role FROM users WHERE user_id=%s", (user_id,))
+    target = cur.fetchone()
+
+    if not target:
+        cur.close()
+        conn.close()
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if target['role'] == 'admin':
+        cur.close()
+        conn.close()
+        raise HTTPException(status_code=400, detail="Cannot delete admin account")
+
+    # Delete user (CASCADE will delete their projects)
+    cur.execute("DELETE FROM users WHERE user_id=%s", (user_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return {"message": "User deleted successfully"}
+
+# ============================================================================
+# ADMIN: MATERIAL PRICE MANAGEMENT
+# ============================================================================
+
+@app.get("/api/admin/materials-prices")
+async def get_all_materials_prices(admin_id: int):
+    """Get all materials with prices (admin only)"""
+    conn = get_conn()
+    cur = conn.cursor()
+
+    # Verify admin
+    cur.execute("SELECT role FROM users WHERE user_id=%s", (admin_id,))
+    admin = cur.fetchone()
+
+    if not admin or admin['role'] != 'admin':
+        cur.close()
+        conn.close()
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    # Get materials with prices
+    cur.execute("""
+        SELECT m.material_id, m.material_name, m.unit, mc.category_name,
+               mp.price_2023, mp.price_2024, mp.price_current,
+               mp.last_updated_at
+        FROM materials m
+        LEFT JOIN material_categories mc ON m.category_id = mc.category_id
+        LEFT JOIN material_prices mp ON m.material_id = mp.material_id
+        ORDER BY mc.display_order, m.material_name
+    """)
+    materials = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    return [{
+        "material_id": m['material_id'],
+        "material_name": m['material_name'],
+        "unit": m['unit'],
+        "category": m['category_name'],
+        "price_2023": float(m['price_2023'] or 0),
+        "price_2024": float(m['price_2024'] or 0),
+        "price_current": float(m['price_current'] or 0),
+        "last_updated": m['last_updated_at'].strftime("%Y-%m-%d %H:%M") if m['last_updated_at'] else None
+    } for m in materials]
+
+@app.post("/api/admin/update-material-prices")
+async def update_material_prices(admin_id: int, updates: List[MaterialPriceUpdate]):
+    """Admin updates material prices (bulk update)"""
+    conn = get_conn()
+    cur = conn.cursor()
+
+    # Verify admin
+    cur.execute("SELECT role FROM users WHERE user_id=%s", (admin_id,))
+    admin = cur.fetchone()
+
+    if not admin or admin['role'] != 'admin':
+        cur.close()
+        conn.close()
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    # Update prices
+    for update in updates:
+        cur.execute("""
+            UPDATE material_prices
+            SET price_current=%s, last_updated_by=%s
+            WHERE material_id=%s
+        """, (update.price_current, admin_id, update.material_id))
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return {"message": f"Updated {len(updates)} material prices successfully"}
+
+# ============================================================================
+# PROJECT PREDICTION
+# ============================================================================
+
+def get_material_prices_dict():
+    """Get current material prices from database"""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT m.material_name, mp.price_current
+        FROM materials m
+        JOIN material_prices mp ON m.material_id = mp.material_id
+    """)
+    prices = {row['material_name']: float(row['price_current']) for row in cur.fetchall()}
+    cur.close()
+    conn.close()
+    return prices
+
+def get_material_climate_impacts_dict():
+    """Get climate impact factors from database"""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT m.material_name, mci.emission_factor_kg_co2_per_kg,
+               mci.energy_consumption_mj, mci.water_usage_liters
+        FROM materials m
+        JOIN material_climatic_impact mci ON m.material_id = mci.material_id
+    """)
+    impacts = {}
+    for row in cur.fetchall():
+        impacts[row['material_name']] = {
+            'co2': float(row['emission_factor_kg_co2_per_kg']),
+            'energy': float(row['energy_consumption_mj'] or 0),
+            'water': float(row['water_usage_liters'] or 0)
+        }
+    cur.close()
+    conn.close()
+    return impacts
+
+def estimate_material_quantities(project_data):
+    """
+    Estimate material quantities based on project specs
+    Returns quantities in their billing units (MT, bags, kg, cft, etc.)
+    """
+    area_sqm = project_data.road_length_km * 1000 * project_data.road_width_m
+    length_km = project_data.road_length_km
+    
+    # Road type multipliers
+    multipliers = {
+        "rural_road": {"cement": 0.35, "bitumen": 0.40, "steel": 0.25, "aggregate": 0.50, "sand": 0.50},
+        "urban_road": {"cement": 0.70, "bitumen": 0.75, "steel": 0.60, "aggregate": 0.80, "sand": 0.80},
+        "highway": {"cement": 1.0, "bitumen": 1.0, "steel": 1.0, "aggregate": 1.0, "sand": 1.0},
+        "expressway": {"cement": 1.40, "bitumen": 1.35, "steel": 1.50, "aggregate": 1.30, "sand": 1.20}
+    }
+    mult = multipliers.get(project_data.project_type.lower().strip(), multipliers["highway"])
+    
+    materials = {}
+    
+    # INCREASED BASE QUANTITIES for more realistic expressway costs
+    # Bitumen (Metric Tons) - Increased from 8kg/m² to 12kg/m² for thicker asphalt
+    materials["Bitumen 60/70"] = area_sqm * 0.012 * mult["bitumen"]  # Was 0.008
+    materials["Bitumen 80/100"] = area_sqm * 0.003 * mult["bitumen"]  # Was 0.002
+    
+    # Asphalt mixes (Metric Tons) - Increased for thicker wearing course
+    materials["Asphaltic Concrete (Mix)"] = area_sqm * 0.150 * mult["bitumen"]  # Was 0.100
+    materials["Premix Carpet (Mix)"] = area_sqm * 0.075 * mult["bitumen"]  # Was 0.050
+    
+    # Cement (50 kg bags) - Increased from 35kg/m² to 50kg/m² for stronger base
+    cement_kg_per_sqm = 50 * mult["cement"]  # Was 35
+    materials["Cement OPC Grade 53"] = (area_sqm * cement_kg_per_sqm) / 50
+    materials["Cement PPC"] = (area_sqm * cement_kg_per_sqm * 0.3) / 50
+    
+    # Steel (kg) - Increased for heavy-duty reinforcement
+    materials["Steel Bar 10mm"] = area_sqm * 4.5 * mult["steel"]  # Was 3
+    materials["Steel Bar 16mm"] = area_sqm * 3.0 * mult["steel"]  # Was 2
+    materials["Steel Mesh"] = area_sqm * 0.4 * mult["steel"]  # Was 0.3
+    
+    # Aggregates (cft) - Increased layer thickness
+    base_thickness_m = 0.20  # Was 0.15 (200mm instead of 150mm)
+    subbase_thickness_m = 0.30  # Was 0.25 (300mm instead of 250mm)
+    
+    base_volume_m3 = area_sqm * base_thickness_m
+    subbase_volume_m3 = area_sqm * subbase_thickness_m
+    
+    materials["Crushed Stone 20mm"] = base_volume_m3 * 35.315 * 0.5 * mult["aggregate"]
+    materials["Crushed Stone 40mm"] = subbase_volume_m3 * 35.315 * 0.4 * mult["aggregate"]
+    materials["Bajri (Sargodha/Deena)"] = subbase_volume_m3 * 35.315 * 0.3 * mult["aggregate"]
+    materials["Brick Ballast (Rora)"] = subbase_volume_m3 * 35.315 * 0.2 * mult["aggregate"]
+    materials["Kankar"] = subbase_volume_m3 * 35.315 * 0.1 * mult["aggregate"]
+    
+    # Sand (cft) - Increased leveling layer
+    sand_volume_m3 = area_sqm * 0.075  # Was 0.05 (75mm instead of 50mm)
+    materials["Ravi Sand"] = sand_volume_m3 * 35.315 * 0.6 * mult["sand"]
+    materials["Chenab Sand"] = sand_volume_m3 * 35.315 * 0.4 * mult["sand"]
+    
+    # Additives (Metric Tons) - Increased for better soil stabilization
+    materials["Hydrated Lime"] = area_sqm * 0.0015 * mult["cement"]  # Was 0.001
+    materials["Fly Ash"] = area_sqm * 0.003 * mult["cement"]  # Was 0.002
+    
+    # Road furniture and accessories - Increased for expressway standards
+    materials["Thermoplastic Paint"] = length_km * 200  # Was 150
+    materials["Glass Beads"] = length_km * 20  # Was 15
+    materials["RCC Pipe 300mm"] = length_km * 150  # Was 100
+    materials["PVC Pipe 200mm"] = length_km * 75  # Was 50
+    materials["W-Beam Guardrail"] = length_km * 300 * mult["steel"]  # Was 200
+    materials["Road Sign (Aluminum)"] = length_km * 15  # Was 10
+    
+    # Terrain adjustment
+    if project_data.location_type.lower().strip() == "mountainous":
+        for key in ["Cement OPC Grade 53", "Steel Bar 10mm", "Steel Bar 16mm",
+                   "Crushed Stone 20mm", "Bitumen 60/70", "W-Beam Guardrail"]:
+            if key in materials:
+                materials[key] *= 1.25
+    
+    # Traffic adjustment
+    traffic_mult = {"low": 0.85, "medium": 1.0, "high": 1.20}.get(
+        project_data.traffic_volume.lower().strip(), 1.0
+    )
+    for key in ["Bitumen 60/70", "Asphaltic Concrete (Mix)", "Cement OPC Grade 53",
+               "Steel Bar 10mm", "Thermoplastic Paint"]:
+        if key in materials:
+            materials[key] *= traffic_mult
+    
+    return materials
+
+@app.post("/api/predict")
+async def predict_project(project_data: ProjectInput, user_id: int):
+    """Predict project cost and generate report"""
+    try:
+        # Get prices and climate impacts from database
+        prices = get_material_prices_dict()
+        climate_impacts = get_material_climate_impacts_dict()
+
+        # Estimate materials
+        materials_qty = estimate_material_quantities(project_data)
+
+        # Calculate costs and climate impact
+        total_cost = 0
+        total_co2_kg = 0
+        total_energy = 0
+        total_water = 0
+        boq_list = []
+        climate_list = []
+
+        conn = get_conn()
+        cur = conn.cursor()
+
+        # Get material IDs and categories
+        cur.execute("""
+            SELECT m.material_id, m.material_name, m.unit, mc.category_name
+            FROM materials m
+            LEFT JOIN material_categories mc ON m.category_id = mc.category_id
+        """)
+        material_info = {row['material_name']: row for row in cur.fetchall()}
+
+        for mat_name, qty_in_correct_unit in materials_qty.items():
+            if qty_in_correct_unit < 0.01:
+                continue
+
+            mat_info = material_info.get(mat_name)
+            if not mat_info:
+                continue
+
+            unit_price = prices.get(mat_name, 0)
+            cost = qty_in_correct_unit * unit_price
+            total_cost += cost
+
+            # Climate impact calculation
+            impact = climate_impacts.get(mat_name, {})
+            
+            # For climate, we need kg - convert if necessary
+            if "Metric Ton" in mat_info['unit']:
+                qty_kg = qty_in_correct_unit * 1000
+            elif "50 kg Bag" in mat_info['unit']:
+                qty_kg = qty_in_correct_unit * 50
+            elif mat_info['unit'] in ['Cubic Foot (cft)', 'Running Meter (RM)', 'Square Foot (ft²)', 'Square Meter (m²)']:
+                # For volume/area units, estimate weight (varies by material)
+                # Rough estimates: 1 cft stone = 45kg, 1 RM pipe = 50kg, 1 m² mesh = 5kg
+                if 'Stone' in mat_name or 'Bajri' in mat_name or 'Ballast' in mat_name:
+                    qty_kg = qty_in_correct_unit * 45  # 45 kg per cft
+                elif 'Sand' in mat_name:
+                    qty_kg = qty_in_correct_unit * 40  # 40 kg per cft
+                elif 'Pipe' in mat_name:
+                    qty_kg = qty_in_correct_unit * 50  # 50 kg per RM
+                elif 'Mesh' in mat_name:
+                    qty_kg = qty_in_correct_unit * 5  # 5 kg per m²
+                else:
+                    qty_kg = qty_in_correct_unit  # Default: assume kg
+            else:
+                qty_kg = qty_in_correct_unit  # Already in kg
+            
+            co2_kg = qty_kg * impact.get('co2', 0)
+            energy_mj = qty_kg * impact.get('energy', 0)
+            water_l = qty_kg * impact.get('water', 0)
+
+            total_co2_kg += co2_kg
+            total_energy += energy_mj
+            total_water += water_l
+
+            # Store BOQ
+            boq_list.append({
+                'material_id': mat_info['material_id'],
+                'material_name': mat_name,
+                'quantity': qty_in_correct_unit,
+                'unit': mat_info['unit'],
+                'unit_price': unit_price,
+                'total_cost': cost,
+                'category': mat_info['category_name']
+            })
+
+            # Store climate impact
+            climate_list.append({
+                'material_id': mat_info['material_id'],
+                'quantity_kg': qty_kg,
+                'co2_kg': co2_kg,
+                'energy_mj': energy_mj,
+                'water_l': water_l
+            })
+                
+        db_boq = cur.fetchall()
+        print("First 10 items retrieved from database:")
+        for row in db_boq:
+            print(f"  {row['material_name']:40s}: {row['quantity']:>12,.2f} {row['unit']:20s} "
+                  f"× PKR {row['unit_price_pkr']:>10,.0f} = PKR {row['total_cost_pkr']:>15,.0f}")
+        
+        print("="*100 + "\n")
+
+        # Calculate budget status
+        within_budget = total_cost <= project_data.max_budget_pkr
+        budget_status = "Within Budget" if within_budget else "Over Budget"
+        budget_diff = project_data.max_budget_pkr - total_cost
+        budget_util = (total_cost / project_data.max_budget_pkr) * 100
+
+        # Insert project
+        area_hectares = (project_data.road_length_km * 1000 * project_data.road_width_m) / 10000
+        cur.execute("""
+            INSERT INTO projects
+            (user_id, project_name, location, location_type, parent_company,
+             road_length_km, road_width_m, area_hectares, project_type,
+             traffic_volume, soil_type, max_budget_pkr)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (user_id, project_data.project_name, project_data.location,
+              project_data.location_type, project_data.parent_company,
+              project_data.road_length_km, project_data.road_width_m, area_hectares,
+              project_data.project_type, project_data.traffic_volume,
+              project_data.soil_type, project_data.max_budget_pkr))
+
+        project_id = cur.lastrowid
+
+        # Insert prediction
+        cur.execute("""
+            INSERT INTO project_predictions
+            (project_id, predicted_cost_pkr, total_co2_emissions_tons,
+             total_energy_mj, total_water_liters, budget_status,
+             budget_difference_pkr, budget_utilization_percent, model_version)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'v2.0')
+        """, (project_id, total_cost, total_co2_kg/1000, total_energy, total_water,
+              budget_status, budget_diff, budget_util))
+
+        # Insert BOQ items
+        for item in boq_list:
+            cur.execute("""
+                INSERT INTO project_boq
+                (project_id, material_id, quantity, unit, unit_price_pkr, total_cost_pkr, category_name)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """, (project_id, item['material_id'], item['quantity'], item['unit'],
+                  item['unit_price'], item['total_cost'], item['category']))
+
+        # Insert climate impact
+        for item in climate_list:
+            cur.execute("""
+                INSERT INTO project_climate_impact
+                (project_id, material_id, quantity_kg, co2_emissions_kg,
+                 energy_consumption_mj, water_usage_liters)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """, (project_id, item['material_id'], item['quantity_kg'],
+                  item['co2_kg'], item['energy_mj'], item['water_l']))
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        return {
+            "project_id": project_id,
+            "project_name": project_data.project_name,
+            "predicted_cost": total_cost,
+            "co2_emissions_tons": total_co2_kg / 1000,
+            "budget_status": budget_status,
+            "within_budget": within_budget,
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M")
+        }
+
+    except Exception as e:
+        print(f"[ERROR] Prediction failed: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+def generate_project_report_text(project, boq, climate, recommendations):
+    """Generate formatted text report for PDF"""
+    
+    report = []
+    report.append("="*80)
+    report.append("ROAD CONSTRUCTION PROJECT - COST ESTIMATION REPORT")
+    report.append("="*80)
+    report.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    report.append("")
+    
+    # Project Details
+    report.append("PROJECT DETAILS:")
+    report.append("-"*80)
+    report.append(f"Project Name:        {project['project_name']}")
+    report.append(f"Location:            {project['location']}")
+    report.append(f"Location Type:       {project['location_type'].title()}")
+    report.append(f"Company:             {project['parent_company']}")
+    report.append(f"Project Type:        {project['project_type'].replace('_', ' ').title()}")
+    report.append(f"Traffic Volume:      {project['traffic_volume'].title()}")
+    report.append(f"Soil Type:           {project['soil_type'].title()}")
+    report.append("")
+    
+    # Road Specifications
+    report.append("ROAD SPECIFICATIONS:")
+    report.append("-"*80)
+    report.append(f"Road Length:         {project['road_length_km']:.2f} km")
+    report.append(f"Road Width:          {project['road_width_m']:.2f} m")
+    report.append(f"Total Area:          {project['area_hectares']:.2f} hectares")
+    report.append("")
+    
+    # Cost Prediction
+    report.append("COST PREDICTION:")
+    report.append("-"*80)
+    report.append(f"**TOTAL PREDICTED COST:  PKR {project['predicted_cost_pkr']:,.2f}**")
+    report.append(f"Maximum Budget:          PKR {project['max_budget_pkr']:,.2f}")
+    report.append(f"Budget Status:           {project['budget_status']}")
+    report.append(f"Budget Difference:       PKR {project['budget_difference']:,.2f}")
+    report.append(f"Budget Utilization:      {project['budget_utilization']:.1f}%")
+    report.append(f"Cost per Kilometer:      PKR {project['predicted_cost_pkr']/project['road_length_km']:,.2f}")
+    report.append("")
+    
+    # Environmental Impact
+    report.append("ENVIRONMENTAL IMPACT:")
+    report.append("-"*80)
+    report.append(f"Total CO2 Emissions:     {project['co2_emissions_tons']:,.2f} tons")
+    report.append(f"CO2 per km:              {project['co2_emissions_tons']/project['road_length_km']:,.2f} tons/km")
+    report.append("")
+    
+    # Bill of Quantities
+    report.append("DETAILED BILL OF QUANTITIES (BOQ):")
+    report.append("="*80)
+    
+    # Group by category
+    categories = {}
+    for item in boq:
+        cat = item['category'] or 'Other'
+        if cat not in categories:
+            categories[cat] = []
+        categories[cat].append(item)
+    
+    for category, items in sorted(categories.items()):
+        report.append(f"\n{category}:")
+        report.append("-"*80)
+        category_total = 0
+        for item in items:
+            report.append(f"{item['material_name']:40s} {item['quantity']:>12,.2f} {item['unit']:15s}")
+            report.append(f"  Unit Price: PKR {item['unit_price']:>12,.2f}  |  Total: PKR {item['total_cost']:>15,.2f}")
+            category_total += item['total_cost']
+        report.append(f"{'Category Subtotal:':56s} PKR {category_total:>15,.2f}")
+        report.append("")
+    
+    report.append("="*80)
+    report.append(f"**TOTAL MATERIALS COST (BOQ):            PKR {project['predicted_cost_pkr']:>15,.2f}**")
+    report.append("="*80)
+    report.append("")
+    
+    # Recommendations
+    if recommendations:
+        report.append("SUSTAINABILITY RECOMMENDATIONS:")
+        report.append("="*80)
+        for rec in recommendations:
+            report.append(f"\n{rec['group']}:")
+            report.append(f"  {rec['text']}")
+            if rec['reduction_percent'] > 0:
+                report.append(f"  Potential Reduction: {rec['reduction_percent']:.1f}%")
+        report.append("")
+    
+    # Footer
+    report.append("="*80)
+    report.append("NOTES:")
+    report.append("- All costs are in Pakistani Rupees (PKR)")
+    report.append("- Prices based on 2025 market rates")
+    report.append("- Material quantities calculated using standard construction practices")
+    report.append("- Additional costs (labor, equipment, overhead) not included")
+    report.append("="*80)
+    report.append("")
+    report.append("Report generated by Road Cost Prediction System")
+    report.append(f"Report Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    report.append("="*80)
+    
+    return "\n".join(report)
+
+
+@app.get("/api/project/{project_id}/download-report")
+async def download_project_report(project_id: int):
+    """Generate and download PDF report for a project"""
+    try:
+        # Import PDF library
+        from backend.utils.pdf_output import generate_output_pdf
+        
+        # Get project details
+        conn = get_conn()
+        cur = conn.cursor()
+        
+        # Get project info
+        cur.execute("""
+            SELECT p.*, pp.predicted_cost_pkr, pp.total_co2_emissions_tons,
+                   pp.budget_status, pp.budget_difference_pkr, pp.budget_utilization_percent
+            FROM projects p
+            LEFT JOIN project_predictions pp ON p.project_id = pp.project_id
+            WHERE p.project_id = %s
+        """, (project_id,))
+        project = cur.fetchone()
+        
+        if not project:
+            cur.close()
+            conn.close()
+            raise HTTPException(status_code=404, detail="Project not found")
+        
+        # Get BOQ
+        cur.execute("""
+            SELECT pb.*, m.material_name
+            FROM project_boq pb
+            JOIN materials m ON pb.material_id = m.material_id
+            WHERE pb.project_id = %s
+            ORDER BY pb.category_name, m.material_name
+        """, (project_id,))
+        boq = cur.fetchall()
+        
+        # Get recommendations
+        cur.execute("SELECT * FROM climate_recommendations ORDER BY priority DESC")
+        recommendations = cur.fetchall()
+        
+        cur.close()
+        conn.close()
+        
+        # Convert to dict format for report generation
+        project_dict = {
+            'project_id': project['project_id'],
+            'project_name': project['project_name'],
+            'location': project['location'],
+            'location_type': project['location_type'],
+            'parent_company': project['parent_company'],
+            'road_length_km': float(project['road_length_km']),
+            'road_width_m': float(project['road_width_m']),
+            'area_hectares': float(project['area_hectares'] or 0),
+            'project_type': project['project_type'],
+            'traffic_volume': project['traffic_volume'],
+            'soil_type': project['soil_type'],
+            'max_budget_pkr': float(project['max_budget_pkr']),
+            'predicted_cost_pkr': float(project['predicted_cost_pkr'] or 0),
+            'co2_emissions_tons': float(project['total_co2_emissions_tons'] or 0),
+            'budget_status': project['budget_status'],
+            'budget_difference': float(project['budget_difference_pkr'] or 0),
+            'budget_utilization': float(project['budget_utilization_percent'] or 0)
+        }
+        
+        boq_list = [{
+            'material_name': b['material_name'],
+            'quantity': float(b['quantity']),
+            'unit': b['unit'],
+            'unit_price': float(b['unit_price_pkr']),
+            'total_cost': float(b['total_cost_pkr']),
+            'category': b['category_name']
+        } for b in boq]
+        
+        rec_list = [{
+            'group': r['group_name'],
+            'text': r['recommendation_text'],
+            'reduction_percent': float(r['potential_reduction_percent'] or 0)
+        } for r in recommendations]
+        
+        # Generate report text
+        report_text = generate_project_report_text(project_dict, boq_list, [], rec_list)
+        
+        # Create downloads directory if it doesn't exist
+        os.makedirs("downloads", exist_ok=True)
+        
+        # Generate PDF filename
+        pdf_filename = f"project_{project_id}_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+        pdf_path = os.path.join("downloads", pdf_filename)
+        
+        # Generate PDF
+        generate_output_pdf(pdf_path, project_dict, report_text)
+        
+        # Return file
+        return FileResponse(
+            path=pdf_path,
+            filename=pdf_filename,
+            media_type='application/pdf',
+            headers={
+                "Content-Disposition": f"attachment; filename={pdf_filename}"
+            }
+        )
+        
+    except Exception as e:
+        print(f"[ERROR] PDF generation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"PDF generation failed: {str(e)}")
+     
 
 # ============================================================================
 # PROJECT MANAGEMENT
 # ============================================================================
 
 @app.get("/api/projects/{user_id}")
-async def get_user_projects(user_id: int):
-    """Get all projects for a user"""
+async def get_user_projects(user_id: int, location_type: Optional[str] = None,
+                          min_budget: Optional[float] = None, max_budget: Optional[float] = None):
+    """Get user's projects with filters"""
     conn = get_conn()
     cur = conn.cursor()
-    
-    cur.execute("""
-        SELECT p.project_id, p.project_name, p.predicted_cost, p.climate_score,
-               p.within_budget, p.pdf_path, p.created_at
+
+    query = """
+        SELECT p.project_id, p.project_name, p.location, p.location_type,
+               p.max_budget_pkr, p.created_at,
+               pp.predicted_cost_pkr, pp.total_co2_emissions_tons, pp.budget_status
         FROM projects p
+        LEFT JOIN project_predictions pp ON p.project_id = pp.project_id
         WHERE p.user_id = %s
-        ORDER BY p.created_at DESC
-    """, (user_id,))
-    
+    """
+    params = [user_id]
+
+    if location_type:
+        query += " AND p.location_type = %s"
+        params.append(location_type)
+
+    if min_budget is not None:
+        query += " AND p.max_budget_pkr >= %s"
+        params.append(min_budget)
+
+    if max_budget is not None:
+        query += " AND p.max_budget_pkr <= %s"
+        params.append(max_budget)
+
+    query += " ORDER BY p.created_at DESC"
+
+    cur.execute(query, tuple(params))
     projects = cur.fetchall()
     cur.close()
     conn.close()
-    
+
     return [{
         "project_id": p['project_id'],
         "project_name": p['project_name'],
-        "predicted_cost": float(p['predicted_cost']),
-        "climate_score": float(p['climate_score']) if p['climate_score'] else 0,
-        "within_budget": bool(p['within_budget']),
-        "pdf_url": f"/api/download/{p['project_id']}",
+        "location": p['location'],
+        "location_type": p['location_type'],
+        "max_budget": float(p['max_budget_pkr']),
+        "predicted_cost": float(p['predicted_cost_pkr'] or 0),
+        "co2_emissions": float(p['total_co2_emissions_tons'] or 0),
+        "budget_status": p['budget_status'],
         "created_at": p['created_at'].strftime("%Y-%m-%d %H:%M")
     } for p in projects]
 
-# ============================================================================
-# HELPER FUNCTIONS FOR ML MODEL
-# ============================================================================
+@app.get("/api/admin/all-projects")
+async def get_all_projects(admin_id: int, location_type: Optional[str] = None,
+                          min_budget: Optional[float] = None, max_budget: Optional[float] = None):
+    """Admin gets all projects with filters"""
+    conn = get_conn()
+    cur = conn.cursor()
 
-def calculate_climate_impact(materials_used):
-    """Calculate environmental impact for all materials"""
-    EMISSION_FACTORS = {
-        "bitumen_60_70": 0.40,
-        "bitumen_80_100": 0.40,
-        "asphalt_concrete": 0.35,
-        "premix_carpet": 0.35,
-        "cement_opc": 0.85,
-        "cement_ppc": 0.75,
-        "steel_10mm": 1.80,
-        "steel_16mm": 1.80,
-        "steel_mesh": 1.80,
-        "crushed_stone_20mm": 0.02,
-        "crushed_stone_40mm": 0.02,
-        "bajri": 0.02,
-        "brick_ballast": 0.15,
-        "kankar": 0.01,
-        "ravi_sand": 0.01,
-        "chenab_sand": 0.01,
-        "hydrated_lime": 0.70,
-        "fly_ash": 0.10,
-        "thermoplastic_paint": 2.50,
-        "glass_beads": 0.50,
-        "rcc_pipe": 0.80,
-        "pvc_pipe": 1.20,
-        "guardrail": 1.50,
-        "road_sign": 2.00,
-    }
-    
-    total_emissions = 0.0
-    total_energy = 0.0
-    total_water = 0.0
-    
-    for material, qty_kg in materials_used.items():
-        if material == "road_type_info":
-            continue
-        factor = EMISSION_FACTORS.get(material, 0)
-        total_emissions += qty_kg * factor
-        
-        if "cement" in material:
-            total_water += qty_kg * 0.5
-        if "steel" in material:
-            total_energy += qty_kg * 25
-    
+    # Verify admin
+    cur.execute("SELECT role FROM users WHERE user_id=%s", (admin_id,))
+    admin = cur.fetchone()
+
+    if not admin or admin['role'] != 'admin':
+        cur.close()
+        conn.close()
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    query = """
+        SELECT p.project_id, p.project_name, p.location, p.location_type,
+               p.max_budget_pkr, p.created_at, u.name as user_name,
+               pp.predicted_cost_pkr, pp.total_co2_emissions_tons, pp.budget_status
+        FROM projects p
+        LEFT JOIN users u ON p.user_id = u.user_id
+        LEFT JOIN project_predictions pp ON p.project_id = pp.project_id
+        WHERE 1=1
+    """
+    params = []
+
+    if location_type:
+        query += " AND p.location_type = %s"
+        params.append(location_type)
+
+    if min_budget is not None:
+        query += " AND p.max_budget_pkr >= %s"
+        params.append(min_budget)
+
+    if max_budget is not None:
+        query += " AND p.max_budget_pkr <= %s"
+        params.append(max_budget)
+
+    query += " ORDER BY p.created_at DESC"
+
+    cur.execute(query, tuple(params))
+    projects = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    return [{
+        "project_id": p['project_id'],
+        "project_name": p['project_name'],
+        "user_name": p['user_name'],
+        "location": p['location'],
+        "location_type": p['location_type'],
+        "max_budget": float(p['max_budget_pkr']),
+        "predicted_cost": float(p['predicted_cost_pkr'] or 0),
+        "co2_emissions": float(p['total_co2_emissions_tons'] or 0),
+        "budget_status": p['budget_status'],
+        "created_at": p['created_at'].strftime("%Y-%m-%d %H:%M")
+    } for p in projects]
+
+@app.get("/api/project/{project_id}/details")
+async def get_project_details(project_id: int):
+    """Get complete project details"""
+    conn = get_conn()
+    cur = conn.cursor()
+
+    # Get project info
+    cur.execute("""
+        SELECT p.*, pp.predicted_cost_pkr, pp.total_co2_emissions_tons,
+               pp.total_energy_mj, pp.total_water_liters, pp.budget_status,
+               pp.budget_difference_pkr, pp.budget_utilization_percent
+        FROM projects p
+        LEFT JOIN project_predictions pp ON p.project_id = pp.project_id
+        WHERE p.project_id = %s
+    """, (project_id,))
+    project = cur.fetchone()
+
+    if not project:
+        cur.close()
+        conn.close()
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    # Get BOQ
+    cur.execute("""
+        SELECT pb.*, m.material_name
+        FROM project_boq pb
+        JOIN materials m ON pb.material_id = m.material_id
+        WHERE pb.project_id = %s
+        ORDER BY pb.category_name, m.material_name
+    """, (project_id,))
+    boq = cur.fetchall()
+
+    # Get climate impact
+    cur.execute("""
+        SELECT pci.*, m.material_name
+        FROM project_climate_impact pci
+        JOIN materials m ON pci.material_id = m.material_id
+        WHERE pci.project_id = %s
+    """, (project_id,))
+    climate = cur.fetchall()
+
+    # Get recommendations
+    cur.execute("SELECT * FROM climate_recommendations ORDER BY priority DESC, group_name")
+    recommendations = cur.fetchall()
+
+    cur.close()
+    conn.close()
+
     return {
-        "total_emissions_kg": total_emissions,
-        "total_emissions_tons": total_emissions / 1000,
-        "total_energy_mj": total_energy,
-        "total_water_liters": total_water
+        "project": {
+            "project_id": project['project_id'],
+            "project_name": project['project_name'],
+            "location": project['location'],
+            "location_type": project['location_type'],
+            "parent_company": project['parent_company'],
+            "road_length_km": float(project['road_length_km']),
+            "road_width_m": float(project['road_width_m']),
+            "area_hectares": float(project['area_hectares'] or 0),
+            "project_type": project['project_type'],
+            "traffic_volume": project['traffic_volume'],
+            "soil_type": project['soil_type'],
+            "max_budget_pkr": float(project['max_budget_pkr']),
+            "predicted_cost_pkr": float(project['predicted_cost_pkr'] or 0),
+            "co2_emissions_tons": float(project['total_co2_emissions_tons'] or 0),
+            "budget_status": project['budget_status'],
+            "budget_difference": float(project['budget_difference_pkr'] or 0),
+            "budget_utilization": float(project['budget_utilization_percent'] or 0)
+        },
+        "boq": [{
+            "material_name": b['material_name'],
+            "quantity": float(b['quantity']),
+            "unit": b['unit'],
+            "unit_price": float(b['unit_price_pkr']),
+            "total_cost": float(b['total_cost_pkr']),
+            "category": b['category_name']
+        } for b in boq],
+        "climate_impact": [{
+            "material_name": c['material_name'],
+            "quantity_kg": float(c['quantity_kg']),
+            "co2_kg": float(c['co2_emissions_kg']),
+            "energy_mj": float(c['energy_consumption_mj']),
+            "water_l": float(c['water_usage_liters'])
+        } for c in climate],
+        "recommendations": [{
+            "group": r['group_name'],
+            "text": r['recommendation_text'],
+            "reduction_percent": float(r['potential_reduction_percent'] or 0),
+            "priority": r['priority']
+        } for r in recommendations]
     }
 
-def get_road_type_multipliers(project_type: str):
-    """Get material quantity multipliers based on road type"""
-    multipliers = {
-        "rural_road": {
-            "cement": 0.35,
-            "bitumen": 0.40,
-            "steel": 0.25,
-            "aggregate": 0.50,
-            "sand": 0.50,
-            "description": "Light-duty rural road with basic specifications"
-        },
-        "urban_road": {
-            "cement": 0.70,
-            "bitumen": 0.75,
-            "steel": 0.60,
-            "aggregate": 0.80,
-            "sand": 0.80,
-            "description": "Urban road with moderate traffic capacity"
-        },
-        "highway": {
-            "cement": 1.0,
-            "bitumen": 1.0,
-            "steel": 1.0,
-            "aggregate": 1.0,
-            "sand": 1.0,
-            "description": "Highway with standard heavy-duty specifications"
-        },
-        "expressway": {
-            "cement": 1.40,
-            "bitumen": 1.35,
-            "steel": 1.50,
-            "aggregate": 1.30,
-            "sand": 1.20,
-            "description": "Expressway with premium specifications"
-        }
-    }
-    
-    return multipliers.get(project_type, multipliers["highway"])
+@app.delete("/api/project/{project_id}")
+async def delete_project(project_id: int, user_id: int):
+    """Delete project (CASCADE deletes all related data)"""
+    conn = get_conn()
+    cur = conn.cursor()
 
-def estimate_material_quantities(input_data: ProjectInput):
-    """
-    Estimate material quantities based on road specifications
-    This provides the base quantities that will be used by the ML model
-    """
-    area_sqm = input_data.road_length_km * 1000 * input_data.road_width_m
-    length_km = input_data.road_length_km
-    
-    road_multipliers = get_road_type_multipliers(input_data.project_type)
-    
-    # Base quantities for highway standard (per sqm or per km)
-    # Wearing Course
-    base_bitumen_60_70 = area_sqm * 40
-    base_bitumen_80_100 = area_sqm * 10
-    base_asphalt_concrete = area_sqm * 120
-    base_premix_carpet = area_sqm * 80
-    
-    # Binding Materials
-    base_cement_opc = area_sqm * 100
-    base_cement_ppc = area_sqm * 20
-    
-    # Steel
-    base_steel_10mm = area_sqm * 15
-    base_steel_16mm = area_sqm * 10
-    base_steel_mesh = area_sqm * 0.3
-    
-    # Aggregates
-    base_crushed_20mm = area_sqm * 150
-    base_crushed_40mm = area_sqm * 100
-    base_bajri = area_sqm * 80
-    
-    # Sub-base
-    base_brick_ballast = area_sqm * 120
-    base_kankar = area_sqm * 150
-    
-    # Sand
-    base_ravi_sand = area_sqm * 100
-    base_chenab_sand = area_sqm * 50
-    
-    # Additives
-    base_hydrated_lime = area_sqm * 5
-    base_fly_ash = area_sqm * 8
-    
-    # Road Furniture (per km)
-    base_paint = length_km * 500
-    base_glass_beads = length_km * 50
-    base_rcc_pipe = length_km * 200
-    base_pvc_pipe = length_km * 100
-    base_guardrail = length_km * 500
-    base_road_sign = length_km * 20
-    
-    # Apply road type multipliers
-    materials = {
-        "bitumen_60_70": base_bitumen_60_70 * road_multipliers["bitumen"],
-        "bitumen_80_100": base_bitumen_80_100 * road_multipliers["bitumen"] * 0.8,
-        "asphalt_concrete": base_asphalt_concrete * road_multipliers["bitumen"],
-        "premix_carpet": base_premix_carpet * road_multipliers["bitumen"] * 0.7,
-        
-        "cement_opc": base_cement_opc * road_multipliers["cement"],
-        "cement_ppc": base_cement_ppc * road_multipliers["cement"] * 0.5,
-        
-        "steel_10mm": base_steel_10mm * road_multipliers["steel"],
-        "steel_16mm": base_steel_16mm * road_multipliers["steel"],
-        "steel_mesh": base_steel_mesh * road_multipliers["steel"],
-        
-        "crushed_stone_20mm": base_crushed_20mm * road_multipliers["aggregate"],
-        "crushed_stone_40mm": base_crushed_40mm * road_multipliers["aggregate"],
-        "bajri": base_bajri * road_multipliers["aggregate"],
-        
-        "brick_ballast": base_brick_ballast * road_multipliers["aggregate"] * 0.8,
-        "kankar": base_kankar * road_multipliers["aggregate"] * 0.9,
-        
-        "ravi_sand": base_ravi_sand * road_multipliers["sand"],
-        "chenab_sand": base_chenab_sand * road_multipliers["sand"] * 0.8,
-        
-        "hydrated_lime": base_hydrated_lime * road_multipliers["cement"] * 0.3,
-        "fly_ash": base_fly_ash * road_multipliers["cement"] * 0.4,
-        
-        "thermoplastic_paint": base_paint,
-        "glass_beads": base_glass_beads,
-        "rcc_pipe_300mm": base_rcc_pipe,
-        "pvc_pipe_200mm": base_pvc_pipe,
-        "w_beam_guardrail": base_guardrail * road_multipliers["steel"],
-        "road_sign": base_road_sign,
-        
-        "road_type_info": road_multipliers["description"]
-    }
-    
-    # Terrain adjustment
-    if input_data.location_type == "mountainous":
-        materials["cement_opc"] *= 1.30
-        materials["steel_10mm"] *= 1.40
-        materials["steel_16mm"] *= 1.40
-        materials["crushed_stone_20mm"] *= 1.25
-        materials["crushed_stone_40mm"] *= 1.25
-        materials["bitumen_60_70"] *= 1.20
-        materials["kankar"] *= 1.20
-        materials["w_beam_guardrail"] *= 1.50
-    
-    # Traffic adjustment
-    traffic_mult = {"low": 0.85, "medium": 1.0, "high": 1.25}.get(input_data.traffic_volume, 1.0)
-    materials["bitumen_60_70"] *= traffic_mult
-    materials["asphalt_concrete"] *= traffic_mult
-    materials["cement_opc"] *= traffic_mult
-    materials["steel_10mm"] *= traffic_mult
-    materials["thermoplastic_paint"] *= traffic_mult
-    
-    return materials
+    # Verify project ownership
+    cur.execute("SELECT user_id FROM projects WHERE project_id=%s", (project_id,))
+    project = cur.fetchone()
 
-def prepare_ml_features(input_data: ProjectInput, materials: dict, prices: dict):
-    """
-    Prepare features for ML model prediction
-    Must match the feature order in train_model.py and inference.py
-    """
-    # Convert materials from kg to tons
-    cement_qty_ton = (materials["cement_opc"] + materials["cement_ppc"]) / 1000
-    bitumen_qty_ton = (materials["bitumen_60_70"] + materials["bitumen_80_100"]) / 1000
-    steel_qty_ton = (materials["steel_10mm"] + materials["steel_16mm"]) / 1000
-    
-    # Get prices (per kg, so we need to adjust for tons)
-    cement_price = prices.get("Cement OPC Grade 53", 1550)  # Price per 50kg bag
-    bitumen_price = prices.get("Bitumen 60/70", 175000)  # Price per ton
-    steel_price = prices.get("Steel Bar 10mm", 255)  # Price per kg
-    
-    # Calculate material costs
-    cement_cost = cement_qty_ton * (cement_price * 20)  # 20 bags per ton
-    bitumen_cost = bitumen_qty_ton * bitumen_price
-    steel_cost = steel_qty_ton * steel_price * 1000  # Convert to kg
-    materials_total = cement_cost + bitumen_cost + steel_cost
-    
-    # Convert road width from meters to km
-    road_width_km = input_data.road_width_m / 1000
-    
-    # Prepare features dictionary matching FEATURE_ORDER in inference.py
-    features = {
-        "road_length_km": input_data.road_length_km,
-        "road_width_km": road_width_km,
-        "cement_qty_ton": cement_qty_ton,
-        "bitumen_qty_ton": bitumen_qty_ton,
-        "steel_qty_ton": steel_qty_ton,
-        "cement_price": cement_price,
-        "bitumen_price": bitumen_price,
-        "steel_price": steel_price,
-        "materials_total": materials_total,
-    }
-    
-    return features, cement_qty_ton, bitumen_qty_ton, steel_qty_ton
+    if not project:
+        cur.close()
+        conn.close()
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    if project['user_id'] != user_id:
+        cur.close()
+        conn.close()
+        raise HTTPException(status_code=403, detail="Not authorized to delete this project")
+
+    # Delete project (CASCADE will delete predictions, BOQ, climate impact)
+    cur.execute("DELETE FROM projects WHERE project_id=%s", (project_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return {"message": "Project deleted successfully"}
 
 # ============================================================================
-# PREDICTION ENGINE (ML MODEL BASED)
+# ADMIN: ADD TRAINING DATA
 # ============================================================================
 
-@app.post("/api/predict", response_model=ProjectResponse)
-async def predict_project_cost(input_data: ProjectInput, user_id: int):
-    """
-    Main prediction endpoint using trained ML model
-    """
-    
+@app.post("/api/admin/add-training-data")
+async def add_training_data(admin_id: int, tender_data: TenderTrainingData):
+    """Admin adds historical project data for ML training"""
+    conn = get_conn()
+    cur = conn.cursor()
+
+    # Verify admin
+    cur.execute("SELECT role FROM users WHERE user_id=%s", (admin_id,))
+    admin = cur.fetchone()
+
+    if not admin or admin['role'] != 'admin':
+        cur.close()
+        conn.close()
+        raise HTTPException(status_code=403, detail="Admin access required")
+
     try:
-        conn = get_conn()
-        cur = conn.cursor()
-        
-        # Get material prices from database
+        # Insert tender
         cur.execute("""
-            SELECT m.material_name, mph.price_pkr
-            FROM materials m
-            JOIN material_price_history mph ON m.material_id = mph.material_id
-            WHERE mph.year = 2025
-        """)
+            INSERT INTO tenders 
+            (tender_no, organization, project_name, location, location_type,
+             parent_company, road_length_km, road_width_m, project_type,
+             traffic_volume, soil_type, actual_cost_pkr, boq_json, used_for_training)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE)
+        """, (tender_data.tender_no, tender_data.organization, tender_data.project_name,
+              tender_data.location, tender_data.location_type, tender_data.parent_company,
+              tender_data.road_length_km, tender_data.road_width_m, tender_data.project_type,
+              tender_data.traffic_volume, tender_data.soil_type, tender_data.actual_cost_pkr,
+              json.dumps(tender_data.boq_items)))
         
-        prices = {row['material_name']: float(row['price_pkr']) for row in cur.fetchall()}
+        tender_id = cur.lastrowid
         
-        # Seed prices if not available
-        if not prices:
-            print("[INFO] No prices found, seeding material price history...")
-            seed_material_price_history()
-            cur.execute("""
-                SELECT m.material_name, mph.price_pkr
-                FROM materials m
-                JOIN material_price_history mph ON m.material_id = mph.material_id
-                WHERE mph.year = 2025
-            """)
-            prices = {row['material_name']: float(row['price_pkr']) for row in cur.fetchall()}
+        # Prepare ML features (same as prediction logic)
+        area_sqm = tender_data.road_length_km * 1000 * tender_data.road_width_m
         
-        # Estimate material quantities
-        materials_result = estimate_material_quantities(input_data)
-        road_type_info = materials_result.get("road_type_info", "Standard specifications")
+        # Calculate material totals from BOQ
+        cement_qty = sum([item['quantity'] for item in tender_data.boq_items 
+                         if 'cement' in item['material_name'].lower()]) / 1000  # tons
+        bitumen_qty = sum([item['quantity'] for item in tender_data.boq_items 
+                          if 'bitumen' in item['material_name'].lower()]) / 1000
+        steel_qty = sum([item['quantity'] for item in tender_data.boq_items 
+                        if 'steel' in item['material_name'].lower()]) / 1000
         
-        # Prepare features for ML model
-        ml_features, cement_qty_ton, bitumen_qty_ton, steel_qty_ton = prepare_ml_features(
-            input_data, materials_result, prices
-        )       
-        # Calculate climate impact using actual material quantities (in kg)
-        material_costs_kg = {
-            "cement_opc": materials_result["cement_opc"],
-            "bitumen_60_70": materials_result["bitumen_60_70"],
-            "steel_10mm": materials_result["steel_10mm"],
-            "steel_16mm": materials_result["steel_16mm"],
-            "crushed_stone_20mm": materials_result["crushed_stone_20mm"],
-            "aggregate": materials_result["crushed_stone_40mm"],
+        # Get average prices
+        prices = get_material_prices_dict()
+        cement_price = prices.get('Cement OPC Grade 53', 1550)
+        bitumen_price = prices.get('Bitumen 60/70', 175000)
+        steel_price = prices.get('Steel Bar 10mm', 255)
+        
+        features = {
+            "road_length_km": tender_data.road_length_km,
+            "road_width_km": tender_data.road_width_m / 1000,
+            "cement_qty_ton": cement_qty,
+            "bitumen_qty_ton": bitumen_qty,
+            "steel_qty_ton": steel_qty,
+            "cement_price": cement_price,
+            "bitumen_price": bitumen_price,
+            "steel_price": steel_price,
+            "materials_total": (cement_qty * cement_price * 20) + (bitumen_qty * bitumen_price) + (steel_qty * steel_price * 1000),
+            "project_type": tender_data.project_type,
+            "location_type": tender_data.location_type,
+            "traffic_volume": tender_data.traffic_volume
         }
         
-        climate_data = calculate_climate_impact(material_costs_kg)
-        climate_score = climate_data["total_emissions_tons"]        
-        # Generate detailed BOQ for PDF with all 24 materials
-        boq_lines = []
-        boq_lines.append(f"Road Type: {input_data.project_type.replace('_', ' ').title()}")
-        boq_lines.append(f"Specification: {road_type_info}")
-        boq_lines.append(f"Terrain: {input_data.location_type.title()}")
-        boq_lines.append(f"Traffic Volume: {input_data.traffic_volume.title()}")
-        boq_lines.append("")
-        boq_lines.append(f"{'Material':<40} {'Quantity':<15} {'Unit Price':<18} {'Total Cost':<18}")
-        boq_lines.append("=" * 100)
-        
-        # Material display info with ALL 24 materials
-        material_display = [
-            # Wearing Course
-            ("Bitumen 60/70", "bitumen_60_70", 1000, "tons", prices.get("Bitumen 60/70", 175000)),
-            ("Bitumen 80/100", "bitumen_80_100", 1000, "tons", prices.get("Bitumen 80/100", 180000)),
-            ("Asphalt Concrete Mix", "asphalt_concrete", 1000, "tons", prices.get("Asphaltic Concrete (Mix)", 26000)),
-            ("Premix Carpet Mix", "premix_carpet", 1000, "tons", prices.get("Premix Carpet (Mix)", 25000)),
-            
-            # Binding Materials
-            ("Cement OPC Grade 53", "cement_opc", 1000, "tons", prices.get("Cement OPC Grade 53", 1550)),
-            ("Cement PPC", "cement_ppc", 1000, "tons", prices.get("Cement PPC", 1530)),
-            
-            # Steel
-            ("Steel Bar 10mm", "steel_10mm", 1000, "tons", prices.get("Steel Bar 10mm", 255)),
-            ("Steel Bar 16mm", "steel_16mm", 1000, "tons", prices.get("Steel Bar 16mm", 255)),
-            ("Steel Mesh", "steel_mesh", 1, "sqm", prices.get("Steel Mesh", 750)),
-            
-            # Aggregates
-            ("Crushed Stone 20mm", "crushed_stone_20mm", 1000, "tons", prices.get("Crushed Stone 20mm", 160)),
-            ("Crushed Stone 40mm", "crushed_stone_40mm", 1000, "tons", prices.get("Crushed Stone 40mm", 155)),
-            ("Bajri", "bajri", 1000, "tons", prices.get("Bajri", 165)),
-            
-            # Sub-base
-            ("Brick Ballast (Rora)", "brick_ballast", 1000, "tons", prices.get("Brick Ballast (Rora)", 95)),
-            ("Kankar", "kankar", 1000, "tons", prices.get("Kankar", 45)),
-            
-            # Sand
-            ("Ravi Sand", "ravi_sand", 1000, "tons", prices.get("Ravi Sand", 55)),
-            ("Chenab Sand", "chenab_sand", 1000, "tons", prices.get("Chenab Sand", 85)),
-            
-            # Additives
-            ("Hydrated Lime", "hydrated_lime", 1000, "tons", prices.get("Hydrated Lime", 30000)),
-            ("Fly Ash", "fly_ash", 1000, "tons", prices.get("Fly Ash", 15000)),
-            
-            # Road Furniture
-            ("Thermoplastic Paint", "thermoplastic_paint", 1, "kg", prices.get("Thermoplastic Paint", 500)),
-            ("Glass Beads", "glass_beads", 1, "kg", prices.get("Glass Beads", 250)),
-            ("RCC Pipe 300mm", "rcc_pipe_300mm", 1, "RM", prices.get("RCC Pipe 300mm", 2200)),
-            ("PVC Pipe 200mm", "pvc_pipe_200mm", 1, "RM", prices.get("PVC Pipe 200mm", 1800)),
-            ("W-Beam Guardrail", "w_beam_guardrail", 1, "RM", prices.get("W-Beam Guardrail", 8000)),
-            ("Road Sign (Aluminum)", "road_sign", 1, "sq.ft", prices.get("Road Sign (Aluminum)", 3500)),
-        ]
-        
-        materials_total_boq = 0
-        material_breakdown = []
-        
-        for display_name, key, divisor, unit, price in material_display:
-            qty_base = materials_result.get(key, 0)
-            qty = qty_base / divisor
-            
-            if qty > 0.01:
-                cost = qty_base * price / divisor if divisor > 1 else qty_base * price
-                materials_total_boq += cost
-                boq_lines.append(
-                    f"{display_name:<40} {qty:>10.2f} {unit:<4} "
-                    f"PKR {price:>12,.2f} PKR {cost:>15,.2f}"
-                )
-                material_breakdown.append(f"  • {display_name}: {qty:.2f} {unit}")
-        
-        # Use materials total as the predicted cost (BOQ only)
-        predicted_cost = materials_total_boq
-        boq_lines.append("=" * 100)
-        boq_lines.append(f"{'TOTAL MATERIALS COST (BOQ Estimated)':<75} PKR {materials_total_boq:>20,.2f}")
-        boq_lines.append("")
-        boq_lines.append("Note: This BOQ includes material costs only. Labor, machinery, profits,")
-        boq_lines.append("      and contractor overhead are NOT included in this estimate.")
-        boq_text = "\n".join(boq_lines)
-        print(f"[INFO] ML Features prepared: {ml_features}")    
-        print(f"[INFO] BOQ Materials Cost: PKR {predicted_cost:,.2f}")
-        
-        # Check if within budget
-        within_budget = predicted_cost <= input_data.max_budget_pkr
-        
-        # Store in database
-        features_json = json.dumps({
-            "road_length_km": input_data.road_length_km,
-            "road_width_m": input_data.road_width_m,
-            "project_type": input_data.project_type,
-            "location_type": input_data.location_type,
-            "traffic_volume": input_data.traffic_volume,
-            "ml_features": ml_features
-        })
-        
+        # Insert ML training data
         cur.execute("""
-            INSERT INTO projects 
-            (user_id, project_name, location, location_type, max_budget_pkr, parent_company,
-             road_length_km, road_width_m, project_type, predicted_cost, climate_score,
-             within_budget, features_json, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-        """, (
-            user_id, input_data.project_name, input_data.location, input_data.location_type,
-            input_data.max_budget_pkr, input_data.parent_company, input_data.road_length_km,
-            input_data.road_width_m, input_data.project_type, predicted_cost, climate_score,
-            within_budget, features_json
-        ))
+            INSERT INTO ml_training_data 
+            (tender_id, features_json, label_cost_pkr, data_quality)
+            VALUES (%s, %s, %s, 'High')
+        """, (tender_id, json.dumps(features), tender_data.actual_cost_pkr))
         
-        project_id = cur.lastrowid
         conn.commit()
-        
-        # Generate PDF with absolute path
-        output_dir = os.path.abspath("output")
-        os.makedirs(output_dir, exist_ok=True)
-        pdf_path = os.path.join(output_dir, f"project_{project_id}.pdf")
-        print(f"[INFO] Generating PDF at: {pdf_path}")
-        
-        report_text = f"""
-ROAD COST PREDICTION REPORT (ML Model Based)
-============================================================
-
-PROJECT DETAILS:
-  Name: {input_data.project_name}
-  Location: {input_data.location} ({input_data.location_type})
-  Company: {input_data.parent_company}
-  Dimensions: {input_data.road_length_km} km × {input_data.road_width_m} m
-  Area: {input_data.road_length_km * input_data.road_width_m / 1000:.2f} hectares
-  Type: {input_data.project_type.replace('_', ' ').title()}
-  Traffic Volume: {input_data.traffic_volume.title()}
-  Soil Type: {input_data.soil_type.title()}
-  Max Budget: PKR {input_data.max_budget_pkr:,.2f}
-
-ROAD SPECIFICATIONS:
-  {road_type_info}
-  Terrain Type: {input_data.location_type.title()}
-  Expected Traffic: {input_data.traffic_volume.title()} volume
-
-ML MODEL PREDICTION:
-  Model: XGBoost Regressor
-  Training Dataset: 500 historical road construction projects
-  Features Used: Road dimensions, material quantities, current market prices
-  
-  **TOTAL COST (BOQ Materials): PKR {predicted_cost:,.2f}**
-  
-  ML Model Features:
-    - Road Length: {ml_features['road_length_km']:.2f} km
-    - Road Width: {input_data.road_width_m:.2f} m
-    - Cement Quantity: {cement_qty_ton:.2f} tons
-    - Bitumen Quantity: {bitumen_qty_ton:.2f} tons
-    - Steel Quantity: {steel_qty_ton:.2f} tons
-    - Current Cement Price: PKR {ml_features['cement_price']:,.2f} per bag
-    - Current Bitumen Price: PKR {ml_features['bitumen_price']:,.2f} per ton
-    - Current Steel Price: PKR {ml_features['steel_price']:,.2f} per kg
-
-BUDGET ANALYSIS:
-  Maximum Budget: PKR {input_data.max_budget_pkr:,.2f}
-  **TOTAL COST (Materials BOQ): PKR {predicted_cost:,.2f}**
-  Status: {'✓ WITHIN BUDGET' if within_budget else '✗ OVER BUDGET'}
-  {'Budget Remaining: PKR {:,.2f} ({:.1f}%)'.format(
-      input_data.max_budget_pkr - predicted_cost,
-      ((input_data.max_budget_pkr - predicted_cost) / input_data.max_budget_pkr) * 100
-  ) if within_budget else 'Over Budget: PKR {:,.2f} ({:.1f}% excess)'.format(
-      predicted_cost - input_data.max_budget_pkr,
-      ((predicted_cost - input_data.max_budget_pkr) / input_data.max_budget_pkr) * 100
-  )}
-  
-  Note: This cost represents material quantities and BOQ estimated prices only.
-        Labor, machinery, equipment, and contractor profits are NOT included.
-        Total project cost typically ranges from 1.8x to 2.5x this amount.
-
-ENVIRONMENTAL IMPACT ASSESSMENT:
-  Total CO₂ Emissions: {climate_data['total_emissions_tons']:.2f} metric tons
-  Equivalent to: {climate_data['total_emissions_tons'] / 4.6:.0f} cars driven for 1 year
-  
-  Energy Consumption: {climate_data['total_energy_mj']:,.0f} MJ
-  Equivalent to: {climate_data['total_energy_mj'] / 3600:.0f} kWh of electricity
-  
-  Water Usage: {climate_data['total_water_liters']:,.0f} liters
-  Equivalent to: {climate_data['total_water_liters'] / 1000:.0f} cubic meters
-  
-  Climate Impact Rating: {'Low' if climate_score < 100 else 'Medium' if climate_score < 500 else 'High'}
-
-DETAILED BILL OF QUANTITIES (BOQ):
-{boq_text}
-
-MATERIAL BREAKDOWN BY CATEGORY:
-
-WEARING COURSE & SURFACE:
-  • Bitumen 60/70: {materials_result['bitumen_60_70'] / 1000:.2f} tons
-  • Bitumen 80/100: {materials_result['bitumen_80_100'] / 1000:.2f} tons
-  • Asphalt Concrete: {materials_result['asphalt_concrete'] / 1000:.2f} tons
-  • Premix Carpet: {materials_result['premix_carpet'] / 1000:.2f} tons
-
-BINDING MATERIALS:
-  • Cement OPC Grade 53: {materials_result['cement_opc'] / 1000:.2f} tons
-  • Cement PPC: {materials_result['cement_ppc'] / 1000:.2f} tons
-
-REINFORCEMENT:
-  • Steel Bar 10mm: {materials_result['steel_10mm'] / 1000:.2f} tons
-  • Steel Bar 16mm: {materials_result['steel_16mm'] / 1000:.2f} tons
-  • Steel Mesh: {materials_result['steel_mesh']:.2f} sqm
-
-AGGREGATES:
-  • Crushed Stone 20mm: {materials_result['crushed_stone_20mm'] / 1000:.2f} tons
-  • Crushed Stone 40mm: {materials_result['crushed_stone_40mm'] / 1000:.2f} tons
-  • Bajri: {materials_result['bajri'] / 1000:.2f} tons
-
-SUB-BASE MATERIALS:
-  • Brick Ballast: {materials_result['brick_ballast'] / 1000:.2f} tons
-  • Kankar: {materials_result['kankar'] / 1000:.2f} tons
-
-SAND & FINE AGGREGATES:
-  • Ravi Sand: {materials_result['ravi_sand'] / 1000:.2f} tons
-  • Chenab Sand: {materials_result['chenab_sand'] / 1000:.2f} tons
-
-ADDITIVES:
-  • Hydrated Lime: {materials_result['hydrated_lime'] / 1000:.2f} tons
-  • Fly Ash: {materials_result['fly_ash'] / 1000:.2f} tons
-
-ROAD FURNITURE & SAFETY:
-  • Thermoplastic Paint: {materials_result['thermoplastic_paint']:.2f} kg
-  • Glass Beads: {materials_result['glass_beads']:.2f} kg
-  • RCC Pipe 300mm: {materials_result['rcc_pipe_300mm']:.2f} RM
-  • PVC Pipe 200mm: {materials_result['pvc_pipe_200mm']:.2f} RM
-  • W-Beam Guardrail: {materials_result['w_beam_guardrail']:.2f} RM
-  • Road Signs: {materials_result['road_sign']:.2f} sq.ft
-
-COST BREAKDOWN:
-  Total Materials Cost (BOQ): PKR {materials_total_boq:,.2f}
-  
-  Note: This estimate includes material costs only.
-        Labor, machinery, equipment, contractor profits, and overhead
-        are NOT included in this BOQ estimate.
-
-RECOMMENDATIONS TO REDUCE ENVIRONMENTAL IMPACT:
-
-1. MATERIAL SUBSTITUTION:
-   • Use recycled aggregates (reduces CO₂ by 20%)
-   • Replace 30% cement with fly ash (reduces emissions by 25%)
-   • Use slag cement instead of OPC (reduces emissions by 40%)
-   • Consider warm mix asphalt (reduces energy by 30%)
-
-2. CONSTRUCTION PRACTICES:
-   • Optimize transportation routes to reduce fuel consumption
-   • Use energy-efficient equipment and machinery
-   • Implement proper waste management and recycling
-   • Schedule work to minimize material waste
-
-3. SUSTAINABLE ALTERNATIVES:
-   • Incorporate recycled plastics in asphalt mix
-   • Use geosynthetics to reduce material quantities
-   • Implement rainwater harvesting during construction
-   • Use solar-powered equipment where possible
-
-4. CARBON OFFSET:
-   • Plant {int(climate_score * 20)} trees to offset CO₂ emissions
-   • Estimated offset time: {int(climate_score / 2)} years
-   • Consider purchasing carbon credits
-
-5. MONITORING & VERIFICATION:
-   • Conduct regular environmental audits
-   • Track actual vs. predicted emissions
-   • Document sustainable practices used
-   • Obtain green building certifications
-
-POTENTIAL SAVINGS:
-  By implementing 50% of recommendations:
-  • CO₂ Reduction: {climate_score * 0.3:.2f} tons ({30}%)
-  • Energy Savings: {climate_data['total_energy_mj'] * 0.25:,.0f} MJ ({25}%)
-  • Water Conservation: {climate_data['total_water_liters'] * 0.20:,.0f} liters ({20}%)
-  • Cost Savings: PKR {predicted_cost * 0.05:,.2f} ({5}% of total cost)
-
-RISK FACTORS:
-  • Material price volatility: ±10-15%
-  • Weather delays: May increase costs by 5-8%
-  • Mountainous terrain: {'Yes - Expect 20% higher costs' if input_data.location_type == 'mountainous' else 'No - Standard costs apply'}
-  • High traffic volume: {'Yes - May require traffic management costs' if input_data.traffic_volume == 'high' else 'No'}
-
-VALIDITY & DISCLAIMER:
-  This BOQ (Bill of Quantities) estimate is based on:
-  • Historical data from 500 similar road construction projects
-  • Current material prices as of December 2025
-  • Standard material quantities for the specified road type
-  • Market rates for construction materials in Pakistan
-  
-  IMPORTANT - What is INCLUDED:
-  ✓ Material quantities for all 24 construction materials
-  ✓ Current market prices for each material
-  ✓ BOQ estimated material costs
-  ✓ Environmental impact calculations
-  
-  IMPORTANT - What is NOT INCLUDED:
-  ✗ Labor costs and wages
-  ✗ Machinery and equipment costs
-  ✗ Contractor overhead and profits
-  ✗ Project management fees
-  ✗ Transportation and logistics beyond material prices
-  ✗ Site preparation and mobilization costs
-  ✗ Testing and quality control expenses
-  ✗ Contingencies and unforeseen costs
-  
-  Actual project costs may vary significantly due to:
-  • Market fluctuations in material prices (±10-15%)
-  • Site-specific conditions and accessibility challenges
-  • Contractor efficiency, experience, and markup (typically 15-30%)
-  • Weather conditions and seasonal factors
-  • Government regulations and compliance requirements
-  • Labor market conditions and availability
-  • Equipment rental and operational costs
-  
-  RECOMMENDATION:
-  This report provides material quantity estimates and BOQ material costs.
-  For complete project costing, add:
-  • Labor costs (typically 25-40% of material costs)
-  • Equipment and machinery (typically 15-25% of material costs)
-  • Contractor overhead and profit (typically 15-30%)
-  • Contingency (typically 10-15%)
-  
-  Total project cost typically ranges from 1.8x to 2.5x the material BOQ cost.
-  
-  This report should be used for preliminary planning and budgeting.
-  Detailed site surveys, engineering assessments, and contractor
-  quotations are strongly recommended before finalizing project costs.
-
-Report Generated: {datetime.now().strftime("%B %d, %Y at %H:%M:%S")}
-Generated By: Road Cost Prediction System v2.0
-Model Version: XGBoost-v1.0 (Trained on 500 projects)
-"""
-        
-        generate_output_pdf(pdf_path, {}, report_text)
-        
-        # Verify PDF was created
-        if not os.path.exists(pdf_path):
-            raise Exception(f"PDF generation failed - file not created at {pdf_path}")
-        
-        file_size = os.path.getsize(pdf_path)
-        print(f"[INFO] PDF created successfully: {file_size} bytes")
-        
-        cur.execute("UPDATE projects SET pdf_path=%s WHERE project_id=%s", (pdf_path, project_id))
-        conn.commit()
-        
         cur.close()
         conn.close()
         
-        return ProjectResponse(
-            project_id=project_id,
-            project_name=input_data.project_name,
-            predicted_cost=predicted_cost,  # This is now materials_total_boq
-            climate_score=climate_score,
-            within_budget=within_budget,
-            pdf_url=f"/api/download/{project_id}",
-            created_at=datetime.now().strftime("%Y-%m-%d %H:%M")
-        )
+        return {
+            "message": "Training data added successfully",
+            "tender_id": tender_id,
+            "can_retrain_model": True
+        }
         
     except Exception as e:
-        print(f"[ERROR] Prediction failed: {e}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e)) 
-
-# ============================================================================
-# FILE DOWNLOAD
-# ============================================================================
-
-from fastapi.responses import FileResponse
-
-@app.get("/api/download/{project_id}")
-async def download_pdf(project_id: int):
-    """Download project PDF with improved error handling"""
-    try:
-        conn = get_conn()
-        cur = conn.cursor()
-        
-        cur.execute("SELECT pdf_path, project_name FROM projects WHERE project_id=%s", (project_id,))
-        result = cur.fetchone()
+        conn.rollback()
         cur.close()
         conn.close()
-        
-        if not result:
-            print(f"[ERROR] Project not found: {project_id}")
-            raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
-        
-        pdf_path = result['pdf_path']
-        project_name = result.get('project_name', 'project')
-        
-        if not pdf_path:
-            print(f"[ERROR] No PDF path for project {project_id}")
-            raise HTTPException(status_code=404, detail="PDF not generated for this project")
-        
-        # Handle both relative and absolute paths
-        if not os.path.isabs(pdf_path):
-            pdf_path = os.path.abspath(pdf_path)
-        
-        print(f"[INFO] Attempting to serve PDF: {pdf_path}")
-        print(f"[INFO] File exists: {os.path.exists(pdf_path)}")
-        
-        if not os.path.exists(pdf_path):
-            print(f"[ERROR] PDF file not found at: {pdf_path}")
-            # Try alternative path
-            alt_path = os.path.join(os.getcwd(), "output", f"project_{project_id}.pdf")
-            print(f"[INFO] Trying alternative path: {alt_path}")
-            if os.path.exists(alt_path):
-                pdf_path = alt_path
-                print(f"[INFO] Found PDF at alternative path")
-            else:
-                raise HTTPException(
-                    status_code=404, 
-                    detail=f"PDF file not found. Expected at: {pdf_path}"
-                )
-        
-        # Clean filename for download
-        safe_name = "".join(c for c in project_name if c.isalnum() or c in (' ', '-', '_')).strip()
-        filename = f"{safe_name}_report.pdf" if safe_name else f"project_{project_id}_report.pdf"
-        
-        return FileResponse(
-            pdf_path,
-            media_type='application/pdf',
-            filename=filename,
-            headers={
-                "Content-Disposition": f'attachment; filename="{filename}"'
-            }
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"[ERROR] Download failed: {e}")
+        print(f"[ERROR] Failed to add training data: {e}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Failed to download PDF: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-# ============================================================================
-# HEALTH CHECK
-# ============================================================================
+@app.get("/api/admin/training-data-count")
+async def get_training_data_count(admin_id: int):
+    """Get count of training data entries"""
+    conn = get_conn()
+    cur = conn.cursor()
+
+    # Verify admin
+    cur.execute("SELECT role FROM users WHERE user_id=%s", (admin_id,))
+    admin = cur.fetchone()
+
+    if not admin or admin['role'] != 'admin':
+        cur.close()
+        conn.close()
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    cur.execute("SELECT COUNT(*) as count FROM ml_training_data")
+    result = cur.fetchone()
+    cur.close()
+    conn.close()
+
+    return {
+        "training_data_count": result['count'],
+        "min_required": 50,
+        "can_retrain": result['count'] >= 50
+    }
 
 @app.get("/api/health")
 async def health_check():
-    """Check API and ML model status"""
+    return {"status": "ok", "message": "API is running"}
+
+@app.post("/api/admin/retrain-model")
+async def retrain_model(admin_id: int):
+    """
+    Admin triggers ML model retraining
+    This runs the train_model.py script and updates the model
+    """
+    import sys  # Add this import at the top
+    
+    conn = get_conn()
+    cur = conn.cursor()
+
+    # Verify admin
+    cur.execute("SELECT role FROM users WHERE user_id=%s", (admin_id,))
+    admin = cur.fetchone()
+
+    if not admin or admin['role'] != 'admin':
+        cur.close()
+        conn.close()
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    # Check if enough training data exists
+    cur.execute("SELECT COUNT(*) as count FROM ml_training_data WHERE label_cost_pkr > 0")
+    result = cur.fetchone()
+    training_count = result['count']
+
+    if training_count < 50:
+        cur.close()
+        conn.close()
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Insufficient training data. Need at least 50 records, have {training_count}"
+        )
+
+    # Log the retraining start
+    cur.execute("""
+        INSERT INTO model_training_logs (admin_id, status, training_data_count, started_at)
+        VALUES (%s, 'in_progress', %s, NOW())
+    """, (admin_id, training_count))
+    log_id = cur.lastrowid
+    conn.commit()
+
     try:
-        # Check if model files exist
-        from backend.ml.inference import MODEL_PATH, SCALER_PATH
-        model_exists = os.path.exists(MODEL_PATH)
-        scaler_exists = os.path.exists(SCALER_PATH)
+        # Run the training script
+        print(f"[INFO] Starting model retraining with {training_count} records...")
         
-        return {
-            "status": "ok",
-            "message": "API is running",
-            "ml_model_loaded": model_exists and scaler_exists,
-            "model_path": MODEL_PATH if model_exists else "Model not found",
-            "scaler_path": SCALER_PATH if scaler_exists else "Scaler not found"
-        }
+        # FIXED: Use sys.executable to use the current Python interpreter (from venv)
+        result = subprocess.run(
+            [sys.executable, "backend/ml/train_model.py"],  # Changed from "python"
+            capture_output=True,
+            text=True,
+            timeout=600,  # 10 minute timeout
+            cwd=os.path.dirname(os.path.dirname(__file__))  # Set working directory to project root
+        )
+
+        if result.returncode == 0:
+            # Training successful
+            print("[SUCCESS] Model retrained successfully!")
+            print(result.stdout)
+            
+            # Close existing connection and create fresh one for success update
+            try:
+                cur.close()
+                conn.close()
+            except:
+                pass
+            
+            # Create fresh connection for success update
+            conn = get_conn()
+            cur = conn.cursor()
+            
+            # Update log (note: %% escapes % for Python string formatting)
+            cur.execute("""
+                UPDATE model_training_logs 
+                SET status='completed', completed_at=NOW(), 
+                    model_version=CONCAT('v', DATE_FORMAT(NOW(), '%%Y%%m%%d_%%H%%i%%s')),
+                    log_output=%s
+                WHERE log_id=%s
+            """, (result.stdout, log_id))
+            conn.commit()
+            
+            cur.close()
+            conn.close()
+            
+            return {
+                "message": "Model retrained successfully!",
+                "training_data_count": training_count,
+                "log_id": log_id,
+                "status": "completed"
+            }
+        else:
+            # Training failed
+            print("[ERROR] Model retraining failed!")
+            print(result.stderr)
+            
+            # Create a fresh connection for error handling
+            conn = get_conn()
+            cur = conn.cursor()
+            
+            cur.execute("""
+                UPDATE model_training_logs 
+                SET status='failed', completed_at=NOW(), error_message=%s
+                WHERE log_id=%s
+            """, (result.stderr, log_id))
+            conn.commit()
+            
+            cur.close()
+            conn.close()
+            
+            raise HTTPException(status_code=500, detail=f"Model training failed: {result.stderr}")
+
+    except subprocess.TimeoutExpired:
+        # Create a fresh connection for error handling
+        conn = get_conn()
+        cur = conn.cursor()
+        
+        cur.execute("""
+            UPDATE model_training_logs 
+            SET status='failed', completed_at=NOW(), error_message='Training timeout (>10 minutes)'
+            WHERE log_id=%s
+        """, (log_id,))
+        conn.commit()
+        cur.close()
+        conn.close()
+        raise HTTPException(status_code=500, detail="Model training timeout")
+
     except Exception as e:
-        return {
-            "status": "ok",
-            "message": "API is running",
-            "ml_model_loaded": False,
-            "error": str(e)
-        }
+        # Create a fresh connection for error handling
+        conn = get_conn()
+        cur = conn.cursor()
+        
+        cur.execute("""
+            UPDATE model_training_logs 
+            SET status='failed', completed_at=NOW(), error_message=%s
+            WHERE log_id=%s
+        """, (str(e), log_id))
+        conn.commit()
+        cur.close()
+        conn.close()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/admin/training-status")
+async def get_training_status(admin_id: int):
+    """Get current training status and history"""
+    conn = get_conn()
+    cur = conn.cursor()
+
+    # Verify admin
+    cur.execute("SELECT role FROM users WHERE user_id=%s", (admin_id,))
+    admin = cur.fetchone()
+
+    if not admin or admin['role'] != 'admin':
+        cur.close()
+        conn.close()
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    # Get training data count
+    cur.execute("SELECT COUNT(*) as count FROM ml_training_data WHERE label_cost_pkr > 0")
+    data_count = cur.fetchone()['count']
+
+    # Get latest training log
+    cur.execute("""
+        SELECT * FROM model_training_logs 
+        ORDER BY started_at DESC 
+        LIMIT 1
+    """)
+    latest_log = cur.fetchone()
+
+    # Get training history
+    cur.execute("""
+        SELECT log_id, admin_id, status, training_data_count, model_version,
+               started_at, completed_at
+        FROM model_training_logs 
+        ORDER BY started_at DESC 
+        LIMIT 10
+    """)
+    history = cur.fetchall()
+
+    cur.close()
+    conn.close()
+
+    return {
+        "training_data_count": data_count,
+        "min_required": 50,
+        "can_retrain": data_count >= 50,
+        "latest_training": {
+            "status": latest_log['status'] if latest_log else None,
+            "training_data_count": latest_log['training_data_count'] if latest_log else 0,
+            "model_version": latest_log['model_version'] if latest_log else None,
+            "started_at": latest_log['started_at'].strftime("%Y-%m-%d %H:%M:%S") if latest_log and latest_log['started_at'] else None,
+            "completed_at": latest_log['completed_at'].strftime("%Y-%m-%d %H:%M:%S") if latest_log and latest_log['completed_at'] else None
+        } if latest_log else None,
+        "training_history": [{
+            "log_id": log['log_id'],
+            "status": log['status'],
+            "training_data_count": log['training_data_count'],
+            "model_version": log['model_version'],
+            "started_at": log['started_at'].strftime("%Y-%m-%d %H:%M:%S") if log['started_at'] else None,
+            "completed_at": log['completed_at'].strftime("%Y-%m-%d %H:%M:%S") if log['completed_at'] else None
+        } for log in history]
+    }
 
 if __name__ == "__main__":
     import uvicorn

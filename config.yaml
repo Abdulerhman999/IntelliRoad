@@ -2,7 +2,7 @@ mysql:
   host: "localhost"
   user: "root"
   password: "andromeda@2006"
-  db: "ml_xgboost"
+  db: "ml_db"
 
 paths:
   pdf_folder: "static/downloaded_pdfs"
