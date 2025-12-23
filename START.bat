@@ -1,6 +1,6 @@
 @echo off
 REM ============================================================
-REM Road Cost Predictor - Startup Script
+REM Road Cost Predictor - Startup Script (START.bat)
 REM ============================================================
 
 color 0A
@@ -20,7 +20,7 @@ echo [1/6] Checking Python...
 python --version >nul 2>&1
 if errorlevel 1 (
     echo [ERROR] Python is not installed or not in PATH
-    echo Please install Python 3.8+ and try again
+    echo Please install Python 3.11 and try again.
     echo.
     pause
     exit /b 1
@@ -45,8 +45,8 @@ echo.
 echo [3/6] Checking MySQL...
 mysql --version >nul 2>&1
 if errorlevel 1 (
-    echo [WARNING] MySQL CLI not found in PATH
-    echo Please make sure MySQL server is running
+    echo [WARNING] MySQL CLI not found in PATH.
+    echo Please ensure your MySQL Database is running.
     timeout /t 3 >nul
 ) else (
     mysql --version
@@ -59,7 +59,7 @@ if exist "venv\Scripts\activate.bat" (
     echo [OK] Virtual environment found
 ) else (
     echo [ERROR] Virtual environment not found!
-    echo Please run setup.bat first
+    echo Please run INSTALL.bat first to set up the system.
     echo.
     pause
     exit /b 1
@@ -88,7 +88,7 @@ echo    STARTING BACKEND SERVER (Port 8000)
 echo ============================================================
 echo.
 
-REM Activate virtual environment and start backend in new window
+REM Activate virtual environment and start backend
 start "Road Cost Predictor - Backend" cmd /k "cd /d "%PROJECT_DIR%" && call venv\Scripts\activate.bat && echo. && echo ============================================== && echo    BACKEND SERVER STARTING... && echo ============================================== && echo. && python -m uvicorn backend.app:app --reload --host 0.0.0.0 --port 8000"
 
 REM Wait for backend to start
@@ -101,16 +101,15 @@ echo    STARTING FRONTEND SERVER (Port 3000)
 echo ============================================================
 echo.
 
-REM Check if node_modules exists before starting
 if not exist "%PROJECT_DIR%road-cost-frontend\node_modules" (
     echo [ERROR] Frontend dependencies not installed!
-    echo Please run setup.bat first
+    echo Please run INSTALL.bat first.
     pause
     exit /b 1
 )
 
-REM Start frontend in new window with explicit path
-start "Road Cost Predictor - Frontend" cmd /k "cd /d "%PROJECT_DIR%road-cost-frontend" && echo. && echo ============================================== && echo    FRONTEND SERVER STARTING... && echo ============================================== && echo. && npm start"
+REM Start frontend with BROWSER=none to prevent duplicate tabs
+start "Road Cost Predictor - Frontend" cmd /k "cd /d "%PROJECT_DIR%road-cost-frontend" && set BROWSER=none && echo. && echo ============================================== && echo    FRONTEND SERVER STARTING... && echo ============================================== && echo. && npm start"
 
 REM Wait for frontend to start
 echo Waiting for frontend to initialize...
@@ -122,7 +121,7 @@ echo    OPENING BROWSER...
 echo ============================================================
 echo.
 
-REM Open browser
+REM Open browser exactly ONE time
 start http://localhost:3000
 
 echo.
@@ -132,34 +131,13 @@ echo ============================================================
 echo.
 echo Frontend:  http://localhost:3000
 echo Backend:   http://localhost:8000
-echo API Docs:  http://localhost:8000/docs
 echo.
-echo Two new terminal windows have opened:
-echo   1. Backend Server  (Green title bar)
-echo   2. Frontend Server (Green title bar)
-echo.
-echo IMPORTANT: Keep both terminal windows open!
-echo.
-echo ============================================================
-echo    HOW TO USE
-echo ============================================================
-echo.
-echo 1. Browser should open automatically
-echo 2. If not, open: http://localhost:3000
-echo 3. Click "Create Account" to register
-echo 4. Login and start creating projects!
+echo IMPORTANT: Keep the two green terminal windows open!
 echo.
 echo ============================================================
 echo    HOW TO STOP
 echo ============================================================
-echo.
-echo Option 1: Close both terminal windows
-echo Option 2: Double-click STOP.bat
-echo Option 3: Press CTRL+C in each terminal window
-echo.
-echo ============================================================
-echo.
-echo You can close this window now.
-echo The application will keep running in the other windows.
+echo Option 1: Close the terminal windows
+echo Option 2: Press CTRL+C in each window
 echo.
 pause

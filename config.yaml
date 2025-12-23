@@ -1,7 +1,7 @@
 mysql:
   host: "localhost"
   user: "root"
-  password: "andromeda@2006"
+  password: "*YOUR PASSWORD*"
   db: "ml_db"
 
 paths:

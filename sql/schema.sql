@@ -1,3 +1,6 @@
+CREATE DATABASE db_ml;
+USE db_ml;
+
 -- 1. USERS TABLE (Admin and Employees)
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS users (
@@ -199,4 +202,23 @@ CREATE TABLE IF NOT EXISTS model_training_logs (
     log_output TEXT,
     error_message TEXT,
     FOREIGN KEY (admin_id) REFERENCES users(user_id)
+);
+
+INSERT INTO users (
+    user_id, 
+    name, 
+    email, 
+    phone, 
+    username, 
+    password_hash, 
+    role
+) 
+VALUES (
+    1, 
+    'System Administrator', 
+    'admin@roadcost.com', 
+    NULL, 
+    'admin', 
+    '240be518fabd2724ddb6f04eeb1da5967448d7e831c08c8fa822809f74c720a9', 
+    'admin'
 );
