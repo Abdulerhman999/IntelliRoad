@@ -1,6 +1,6 @@
 mysql:
   host: "localhost"
-  user: "root"
+  user: ""
   password: ""
   db: "ml_db"
 
@@ -20,3 +20,5 @@ training:
   scaler_path: "models/scaler.joblib"
   test_size: 0.2
   random_state: 42
+
+
