@@ -11,28 +11,9 @@ Before you begin, ensure you have the following installed:
 - **MySQL Server** (Make sure it is running)
 - **Git**
 
-### Installation Guide
-
-#### 1. Database Configuration
-You need to set up the MySQL database manually.
-1. Open your MySQL tool (Workbench, HeidiSQL, or Command Line).
-2. Open and run the script located at:
-   `sql/schema.sql`
-   *(This creates the `ml_db` database and necessary tables).*
-
-#### 2. Update Configuration
-Connect the application to your database.
-1. Open the **`config.yaml`** file in the root directory.
-2. Find the `mysql` section.
-3. Replace the password field with your actual MySQL root password:
-   ```yaml
-   mysql:
-     host: "localhost"
-     user: "root"
-     password: "YOUR_REAL_PASSWORD_HERE"  <-- Change this
-     db: "ml_db"
-
-#### 3. Automated Setup
+### Installation Guide (Automated Setup)
 We have included a one-click installer to handle dependencies and environment setup.
-1. Double-click the **`INSTALL.bat`** file in the root directory.
+1. Right-click the **`INSTALL.bat`** file in the root directory and RUN it as an admin.
 2. Wait for the process to complete (this will install Python libraries, Node.js packages, and set up the virtual environment).
+3. Everything Will start working.
+4. Admin login is (Username = admin , Password = admin123).

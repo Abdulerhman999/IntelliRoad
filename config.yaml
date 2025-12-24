@@ -1,7 +1,7 @@
 mysql:
   host: "localhost"
-  user: ""
-  password: ""
+  user: "intelliroad_user"
+  password: ":1URxb-PtyO9&;v["
   db: "ml_db"
 
 paths:
@@ -20,5 +20,8 @@ training:
   scaler_path: "models/scaler.joblib"
   test_size: 0.2
   random_state: 42
+
+
+
 
 

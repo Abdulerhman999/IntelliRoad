@@ -8,7 +8,7 @@ title Road Cost Predictor - Starting...
 
 echo.
 echo ============================================================
-echo    ROAD COST PREDICTOR - STARTUP
+echo     ROAD COST PREDICTOR - STARTUP
 echo ============================================================
 echo.
 
@@ -20,124 +20,82 @@ echo [1/6] Checking Python...
 python --version >nul 2>&1
 if errorlevel 1 (
     echo [ERROR] Python is not installed or not in PATH
-    echo Please install Python 3.11 and try again.
-    echo.
+    echo Please run INSTALL.bat first.
     pause
     exit /b 1
 )
-python --version
-echo [OK] Python found
 
-echo.
 echo [2/6] Checking Node.js...
 node --version >nul 2>&1
 if errorlevel 1 (
     echo [ERROR] Node.js is not installed or not in PATH
-    echo Please install Node.js and try again
-    echo.
     pause
     exit /b 1
 )
-node --version
-echo [OK] Node.js found
 
-echo.
 echo [3/6] Checking MySQL...
 mysql --version >nul 2>&1
 if errorlevel 1 (
-    echo [WARNING] MySQL CLI not found in PATH.
-    echo Please ensure your MySQL Database is running.
-    timeout /t 3 >nul
-) else (
-    mysql --version
-    echo [OK] MySQL found
+    echo [WARNING] MySQL CLI not found. Ensure MySQL is running.
 )
 
-echo.
 echo [4/6] Checking virtual environment...
-if exist "venv\Scripts\activate.bat" (
-    echo [OK] Virtual environment found
-) else (
-    echo [ERROR] Virtual environment not found!
-    echo Please run INSTALL.bat first to set up the system.
-    echo.
+if not exist "venv\Scripts\activate.bat" (
+    echo [ERROR] Virtual environment not found! Please run INSTALL.bat.
     pause
     exit /b 1
 )
 
-echo.
 echo [5/6] Checking model files...
-if exist "models\xgb_model.joblib" (
-    if exist "models\scaler.joblib" (
-        echo [OK] ML model files found
-    ) else (
-        echo [WARNING] Scaler file missing - predictions may fail
-        timeout /t 2 >nul
-    )
-) else (
-    echo [WARNING] ML model not found - will use fallback calculations
-    echo You can train the model later with: python -m backend.ml.train_model
-    timeout /t 3 >nul
+if not exist "models\xgb_model.joblib" (
+    echo [WARNING] ML model not found - using fallback calculations.
 )
 
 echo.
 echo [6/6] Starting servers...
 echo.
 echo ============================================================
-echo    STARTING BACKEND SERVER (Port 8000)
+echo     STARTING BACKEND SERVER (Port 8000)
 echo ============================================================
-echo.
 
-REM Activate virtual environment and start backend
-start "Road Cost Predictor - Backend" cmd /k "cd /d "%PROJECT_DIR%" && call venv\Scripts\activate.bat && echo. && echo ============================================== && echo    BACKEND SERVER STARTING... && echo ============================================== && echo. && python -m uvicorn backend.app:app --reload --host 0.0.0.0 --port 8000"
+REM Start backend in new window
+start "Road Cost Predictor - Backend" cmd /k "cd /d "%PROJECT_DIR%" && call venv\Scripts\activate.bat && python -m uvicorn backend.app:app --reload --host 0.0.0.0 --port 8000"
 
 REM Wait for backend to start
-echo Waiting for backend to initialize...
-timeout /t 8 /nobreak >nul
+timeout /t 5 /nobreak >nul
 
 echo.
 echo ============================================================
-echo    STARTING FRONTEND SERVER (Port 3000)
+echo     STARTING FRONTEND SERVER (Port 3000)
 echo ============================================================
-echo.
 
 if not exist "%PROJECT_DIR%road-cost-frontend\node_modules" (
-    echo [ERROR] Frontend dependencies not installed!
-    echo Please run INSTALL.bat first.
+    echo [ERROR] Frontend dependencies not installed! Run INSTALL.bat.
     pause
     exit /b 1
 )
 
-REM Start frontend with BROWSER=none to prevent duplicate tabs
-start "Road Cost Predictor - Frontend" cmd /k "cd /d "%PROJECT_DIR%road-cost-frontend" && set BROWSER=none && echo. && echo ============================================== && echo    FRONTEND SERVER STARTING... && echo ============================================== && echo. && npm start"
+REM START FRONTEND: set BROWSER=none stops React from opening a tab automatically
+start "Road Cost Predictor - Frontend" cmd /k "cd /d "%PROJECT_DIR%road-cost-frontend" && set BROWSER=none && npm start"
 
-REM Wait for frontend to start
-echo Waiting for frontend to initialize...
+echo.
+echo Waiting for servers to initialize...
+echo The website will open automatically in 10 seconds.
+echo.
 timeout /t 10 /nobreak >nul
 
-echo.
-echo ============================================================
-echo    OPENING BROWSER...
-echo ============================================================
-echo.
-
-REM Open browser exactly ONE time
+REM --- THE FIX ---
+REM This is the ONLY command that will open a browser tab.
 start http://localhost:3000
 
 echo.
 echo ============================================================
-echo    APPLICATION STARTED SUCCESSFULLY!
+echo     APPLICATION STARTED SUCCESSFULLY!
 echo ============================================================
 echo.
 echo Frontend:  http://localhost:3000
 echo Backend:   http://localhost:8000
 echo.
-echo IMPORTANT: Keep the two green terminal windows open!
-echo.
-echo ============================================================
-echo    HOW TO STOP
-echo ============================================================
-echo Option 1: Close the terminal windows
-echo Option 2: Press CTRL+C in each window
+echo IMPORTANT: Keep the two server windows open!
 echo.
 pause

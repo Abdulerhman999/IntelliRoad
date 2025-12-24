@@ -89,7 +89,7 @@ function MainSetup {
     # ------------------------------------------------
     Log "[3/6] Setting up Database"
 
-    Write-Host "Enter your MySQL ROOT password (used only once):" -ForegroundColor Yellow
+    Write-Host "Enter your MySQL ROOT password :" -ForegroundColor Yellow
     $rootPass = Read-Host -AsSecureString
     $rootPassPlain = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
         [Runtime.InteropServices.Marshal]::SecureStringToBSTR($rootPass)
@@ -155,11 +155,12 @@ function MainSetup {
     if (Test-Path "venv") { Remove-Item venv -Recurse -Force }
 
     & $PYTHON -m venv venv
-    & ".\venv\Scripts\pip.exe" install --upgrade pip
-    & ".\venv\Scripts\pip.exe" install fastapi "uvicorn[standard]" pymysql pyyaml python-multipart | Out-Null
+    & ".\venv\Scripts\python.exe" -m pip install --upgrade pip --quiet
+    Log "Installing Python libraries..."
+& ".\venv\Scripts\python.exe" -m pip install fastapi "uvicorn[standard]" pymysql pyyaml "python-multipart" --quiet
 
     if (Test-Path "requirements.txt") {
-        & ".\venv\Scripts\pip.exe" install -r requirements.txt | Out-Null
+        & ".\venv\Scripts\python.exe" -m pip install -r requirements.txt --quiet
     }
 
     if (Test-Path "road-cost-frontend") {
