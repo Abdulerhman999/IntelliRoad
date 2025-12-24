@@ -84,10 +84,6 @@ echo The website will open automatically in 10 seconds.
 echo.
 timeout /t 10 /nobreak >nul
 
-REM --- THE FIX ---
-REM This is the ONLY command that will open a browser tab.
-start http://localhost:3000
-
 echo.
 echo ============================================================
 echo     APPLICATION STARTED SUCCESSFULLY!

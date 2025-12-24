@@ -5,7 +5,7 @@ color 0B
 cd /d "%~dp0"
 
 echo ============================================================
-echo   INTELLIROAD - ONE CLICK INSTALLER
+echo    INTELLIROAD - ONE CLICK INSTALLER
 echo ============================================================
 echo.
 
@@ -14,8 +14,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "iex ((Get-Content '%~f0'
 
 echo.
 echo ============================================================
-echo   INSTALLATION COMPLETE
-echo   Run START.bat to launch the project
+echo    PROCESS FINISHED
 echo ============================================================
 pause
 goto :eof
@@ -28,7 +27,6 @@ function Log($msg) {
 }
 
 function MainSetup {
-
     $ErrorActionPreference = "Stop"
     $PROJECT_DIR = Get-Location
     Log "`n=== INSTALL STARTED $(Get-Date) ==="
@@ -38,12 +36,22 @@ function MainSetup {
     # ------------------------------------------------
     Log "[1/6] Checking Environment"
 
-    if (Get-Command python -ErrorAction SilentlyContinue) {
-        $PYTHON = "python"
-    } elseif (Get-Command py -ErrorAction SilentlyContinue) {
-        $PYTHON = "py"
-    } else {
-        Log "[ERROR] Python not found. Install Python 3.10+ and enable 'Add to PATH'"
+    $PYTHON = $null
+    if (Get-Command python -ErrorAction SilentlyContinue) { $PYTHON = "python" }
+    elseif (Get-Command py -ErrorAction SilentlyContinue) { $PYTHON = "py" }
+    
+    # Auto-Install Python if missing
+    if (-not $PYTHON) {
+        Log "[FIX] Python not found. Attempting auto-install..."
+        winget install -e --id Python.Python.3.11 --scope machine --accept-source-agreements --accept-package-agreements
+        $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+        
+        if (Get-Command python -ErrorAction SilentlyContinue) { $PYTHON = "python" }
+        elseif (Get-Command py -ErrorAction SilentlyContinue) { $PYTHON = "py" }
+    }
+
+    if (-not $PYTHON) {
+        Log "[ERROR] Auto-install failed. Please install Python 3.11 manually."
         exit
     }
     Log "[OK] Python detected: $PYTHON"
@@ -59,7 +67,6 @@ function MainSetup {
     # 2. MYSQL DETECTION
     # ------------------------------------------------
     Log "[2/6] Detecting MySQL"
-
     $mysqlPaths = @(
         "C:\xampp\mysql\bin\mysql.exe",
         "$env:ProgramFiles\MySQL\MySQL Server*\bin\mysql.exe",
@@ -73,13 +80,11 @@ function MainSetup {
     }
 
     if (-not $mysqlCmd) {
-        if (Get-Command mysql -ErrorAction SilentlyContinue) {
-            $mysqlCmd = (Get-Command mysql).Source
-        }
+        if (Get-Command mysql -ErrorAction SilentlyContinue) { $mysqlCmd = (Get-Command mysql).Source }
     }
 
     if (-not $mysqlCmd) {
-        Log "[ERROR] MySQL not found. Install MySQL or XAMPP and try again."
+        Log "[ERROR] MySQL not found. Please install MySQL or XAMPP."
         exit
     }
     Log "[OK] MySQL detected: $mysqlCmd"
@@ -99,11 +104,9 @@ function MainSetup {
     $DB_USER = "intelliroad_user"
     $DB_PASS = -join ((33..126) | Get-Random -Count 16 | ForEach-Object {[char]$_})
 
-    # Create temporary login file for root
     $loginFileRoot = "$PROJECT_DIR\mylogin_root.cnf"
     Set-Content -Path $loginFileRoot -Value "[client]`nuser=root`npassword=$rootPassPlain" -Encoding ASCII
 
-    # Drop and recreate user + DB
     & $mysqlCmd --defaults-extra-file=$loginFileRoot -e "
         CREATE DATABASE IF NOT EXISTS $DB_NAME;
         DROP USER IF EXISTS '$DB_USER'@'localhost';
@@ -115,7 +118,7 @@ function MainSetup {
     Log "[OK] Database and user created"
 
     # ------------------------------------------------
-    # 4. SCHEMA IMPORT
+    # 4. SCHEMA IMPORT (FIXED)
     # ------------------------------------------------
     Log "[4/6] Importing schema"
 
@@ -124,14 +127,18 @@ function MainSetup {
         exit
     }
 
-    # Create login file for intelliroad_user
     $loginFileUser = "$PROJECT_DIR\mylogin_user.cnf"
     Set-Content -Path $loginFileUser -Value "[client]`nuser=$DB_USER`npassword=$DB_PASS" -Encoding ASCII
 
-    Start-Sleep -Seconds 1
-    cmd /c "`"$mysqlCmd`" --defaults-extra-file=$loginFileUser $DB_NAME < sql\schema.sql" 2>$null
+    # --- FIX: Use PowerShell piping instead of CMD ---
+    try {
+        Get-Content "sql\schema.sql" | & $mysqlCmd --defaults-extra-file=$loginFileUser $DB_NAME
+        Log "[OK] Schema imported"
+    } catch {
+        Log "[ERROR] Schema import failed. Check schema.sql."
+    }
+
     Remove-Item $loginFileUser -Force
-    Log "[OK] Schema imported"
 
     # ------------------------------------------------
     # 5. CONFIG UPDATE
@@ -156,8 +163,9 @@ function MainSetup {
 
     & $PYTHON -m venv venv
     & ".\venv\Scripts\python.exe" -m pip install --upgrade pip --quiet
+    
     Log "Installing Python libraries..."
-& ".\venv\Scripts\python.exe" -m pip install fastapi "uvicorn[standard]" pymysql pyyaml "python-multipart" --quiet
+    & ".\venv\Scripts\python.exe" -m pip install fastapi "uvicorn[standard]" pymysql pyyaml "python-multipart" --quiet
 
     if (Test-Path "requirements.txt") {
         & ".\venv\Scripts\python.exe" -m pip install -r requirements.txt --quiet
